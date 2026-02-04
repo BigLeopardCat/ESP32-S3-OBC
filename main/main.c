@@ -18,11 +18,6 @@
 #include "lwip/sockets.h"
 #include "lwip/dns.h"
 #include "lwip/netdb.h"
-#include "esp_bt.h"
-#include "esp_gap_ble_api.h"
-#include "esp_gatts_api.h"
-#include "esp_bt_defs.h"
-#include "esp_bt_main.h"
 #include "esp_rom_sys.h"
 
 #define TAG "OBC_PRO"
@@ -37,22 +32,6 @@ static bool s_web_authenticated = false;
 static httpd_handle_t s_http_server = NULL;
 static char wifi_ssid[33] = {0};
 static char wifi_pass[65] = {0};
-
-/* --- BLE --- */
-#define DEVICE_NAME "OBC_DIMMER"
-static uint8_t adv_service_uuid128[32] = { 0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00 };
-static esp_ble_adv_data_t adv_data = { .set_scan_rsp=false, .include_name=true, .include_txpower=false, .min_interval=0x0006, .max_interval=0x0010, .appearance=0x00, .manufacturer_len=0, .p_manufacturer_data=NULL, .service_data_len=0, .p_service_data=NULL, .service_uuid_len=16, .p_service_uuid=adv_service_uuid128, .flag=(ESP_BLE_ADV_FLAG_GEN_DISC|ESP_BLE_ADV_FLAG_BREDR_NOT_SPT) };
-static esp_ble_adv_params_t adv_params = { .adv_int_min=0x20, .adv_int_max=0x40, .adv_type=ADV_TYPE_IND, .own_addr_type=BLE_ADDR_TYPE_PUBLIC, .channel_map=ADV_CHNL_ALL, .adv_filter_policy=ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY };
-static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) { if (event == ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT) esp_ble_gap_start_advertising(&adv_params); }
-static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
-    if (event == ESP_GATTS_REG_EVT) {
-        esp_ble_gap_set_device_name(DEVICE_NAME); esp_ble_gap_config_adv_data(&adv_data);
-        esp_gatt_srvc_id_t service_id = {.is_primary=true, .id.inst_id=0x00, .id.uuid.len=ESP_UUID_LEN_16, .id.uuid.uuid.uuid16=0x00FF};
-        esp_ble_gatts_create_service(gatts_if, &service_id, 4);
-    } else if (event == ESP_GATTS_CREATE_EVT) {
-        esp_ble_gatts_start_service(param->create.service_handle);
-    } 
-}
 
 /* --- NVS --- */
 void save_config(void) {
@@ -268,11 +247,6 @@ void app_main(void) {
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
     esp_netif_create_default_wifi_sta(); esp_netif_create_default_wifi_ap();
     wifi_init_config_t c=WIFI_INIT_CONFIG_DEFAULT(); esp_wifi_init(&c);
-
-    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-    esp_bt_controller_config_t bc=BT_CONTROLLER_INIT_CONFIG_DEFAULT(); esp_bt_controller_init(&bc); esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    esp_bluedroid_config_t bdc=BT_BLUEDROID_INIT_CONFIG_DEFAULT(); esp_bluedroid_init_with_cfg(&bdc); esp_bluedroid_enable();
-    esp_ble_gatts_register_callback(gatts_profile_event_handler); esp_ble_gap_register_callback(gap_event_handler); esp_ble_gatts_app_register(0);
 
     xTaskCreate(dns_task, "dns", 4096, NULL, 5, NULL);
     xTaskCreate(btn_task, "btn", 4096, NULL, 5, NULL);
