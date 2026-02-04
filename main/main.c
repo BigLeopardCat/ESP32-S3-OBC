@@ -26,7 +26,6 @@
 #include "esp_rom_sys.h"
 
 #define TAG "OBC_PRO"
-#define LED_PIN             5
 #define BOOT_BUTTON_GPIO    0
 #define DEFAULT_SSID   "OBC_Device"
 #define WEB_PASSWORD   "admin"
@@ -35,24 +34,9 @@
 static bool s_wifi_master_on = false;
 static bool s_in_ap_mode = false;
 static bool s_web_authenticated = false;
-static uint8_t s_bright = 50;
 static httpd_handle_t s_http_server = NULL;
 static char wifi_ssid[33] = {0};
 static char wifi_pass[65] = {0};
-
-/* --- PWM / LED --- */
-void ledc_init(void) {
-    ledc_timer_config_t t = { .speed_mode=LEDC_LOW_SPEED_MODE, .timer_num=LEDC_TIMER_0, .duty_resolution=LEDC_TIMER_13_BIT, .freq_hz=5000, .clk_cfg=LEDC_AUTO_CLK };
-    ledc_timer_config(&t);
-    ledc_channel_config_t c = { .speed_mode=LEDC_LOW_SPEED_MODE, .channel=LEDC_CHANNEL_0, .timer_sel=LEDC_TIMER_0, .intr_type=LEDC_INTR_DISABLE, .gpio_num=LED_PIN, .duty=0, .hpoint=0 };
-    ledc_channel_config(&c);
-}
-void set_brightness(uint8_t percent) {
-    if (percent > 100) percent = 100;
-    s_bright = percent;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, (percent*8191)/100);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-}
 
 /* --- BLE --- */
 #define DEVICE_NAME "OBC_DIMMER"
@@ -67,9 +51,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         esp_ble_gatts_create_service(gatts_if, &service_id, 4);
     } else if (event == ESP_GATTS_CREATE_EVT) {
         esp_ble_gatts_start_service(param->create.service_handle);
-        esp_bt_uuid_t char_uuid = { .len=ESP_UUID_LEN_16, .uuid={.uuid16=0xFF01} };
-        esp_ble_gatts_add_char(param->create.service_handle, &char_uuid, ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE, ESP_GATT_CHAR_PROP_BIT_READ|ESP_GATT_CHAR_PROP_BIT_WRITE, NULL, NULL);
-    } else if (event == ESP_GATTS_WRITE_EVT) { if (param->write.len == 1) set_brightness(param->write.value[0]); }
+    } 
 }
 
 /* --- NVS --- */
@@ -77,7 +59,6 @@ void save_config(void) {
     nvs_handle_t h;
     if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_str(h, "ssid", wifi_ssid); nvs_set_str(h, "pass", wifi_pass);
-        nvs_set_u8(h, "bright", s_bright);
         nvs_commit(h); nvs_close(h);
     }
 }
@@ -86,10 +67,8 @@ void load_config(void) {
     if (nvs_open("storage", NVS_READONLY, &h) == ESP_OK) {
         size_t len=sizeof(wifi_ssid); if(nvs_get_str(h, "ssid", wifi_ssid, &len)!=ESP_OK) wifi_ssid[0]=0;
         len=sizeof(wifi_pass); if(nvs_get_str(h, "pass", wifi_pass, &len)!=ESP_OK) wifi_pass[0]=0;
-        nvs_get_u8(h, "bright", &s_bright);
         nvs_close(h);
     }
-    set_brightness(s_bright);
 }
 
 /* --- OTA & Web Util --- */
@@ -142,12 +121,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
     
     char buf[512]; 
     httpd_resp_send_chunk(req, HTML_HEAD, HTTPD_RESP_USE_STRLEN);
-    
-    /* Section 1: Light */
-    snprintf(buf, sizeof(buf), "<h2>Control Center</h2><div class='card'><h3>Light</h3><input type='range' oninput='D(this.value)' value='%d'></div>", 
-             s_bright);
-    httpd_resp_send_chunk(req, buf, HTTPD_RESP_USE_STRLEN);
-    
+
     /* Section 2: WiFi */
     snprintf(buf, sizeof(buf), "<div class='card'><h3>WiFi</h3><form id='wf' action='/api/w' method='post'><input name='s' value='%s' placeholder='SSID'><input name='p' value='%s' placeholder='Pass'></form><button onclick='W()'>Save & Connect</button></div>", 
              wifi_ssid, wifi_pass);
@@ -168,10 +142,6 @@ static esp_err_t api_handler(httpd_req_t *req) {
     if(type=='w') { /* WiFi */
         int ret=httpd_req_recv(req, buf, sizeof(buf)-1); if(ret>0){ buf[ret]=0; parse_param(buf,"s",wifi_ssid,sizeof(wifi_ssid)); parse_param(buf,"p",wifi_pass,sizeof(wifi_pass)); save_config(); }
         httpd_resp_send(req,"Saved.",-1);
-    } else if(httpd_req_get_url_query_str(req,buf,sizeof(buf))==ESP_OK) {
-        char v[10]={0}; parse_param(buf,"v",v,sizeof(v));
-        if(type=='d') set_brightness(atoi(v)); /* Dim */
-        httpd_resp_send(req,"OK",2);
     } return ESP_OK;
 }
 static esp_err_t ota_handler(httpd_req_t *req) {
@@ -207,16 +177,23 @@ void start_ap(void) {
     wifi_config_t c = { .ap = { .ssid=DEFAULT_SSID, .ssid_len=strlen(DEFAULT_SSID), .max_connection=4, .authmode=WIFI_AUTH_OPEN } };
     esp_wifi_set_mode(WIFI_MODE_AP); esp_wifi_set_config(WIFI_IF_AP, &c); esp_wifi_start();
     
-    httpd_config_t h = HTTPD_DEFAULT_CONFIG(); h.max_uri_handlers=12; h.stack_size=8192; h.uri_match_fn = httpd_uri_match_wildcard;
+    httpd_config_t h = HTTPD_DEFAULT_CONFIG(); 
+    h.max_uri_handlers = 13; 
+    h.stack_size = 8192; 
+    h.uri_match_fn = httpd_uri_match_wildcard;
+    h.lru_purge_enable = true; // Clean up old connections
+    
     httpd_start(&s_http_server, &h);
     httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/",.method=HTTP_GET,.handler=root_handler});
     httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/login",.method=HTTP_POST,.handler=login_handler});
     httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/api/w",.method=HTTP_POST,.handler=api_handler});
-    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/api/d",.method=HTTP_POST,.handler=api_handler}); // POST for slider
-    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/api/c",.method=HTTP_POST,.handler=api_handler});
     httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/ota",.method=HTTP_POST,.handler=ota_handler});
     httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/ota/remote",.method=HTTP_POST,.handler=ota_remote_trigger_handler});
+    
+    // Catch-all handlers for Captive Portal (MUST be last)
+    // Handle both GET and POST to avoid "Method not allowed" spam from background apps
     httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/*",.method=HTTP_GET,.handler=captive_portal_handler});
+    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/*",.method=HTTP_POST,.handler=captive_portal_handler}); 
 
     s_in_ap_mode=true; s_web_authenticated=false;
 }
@@ -284,7 +261,7 @@ void btn_task(void*z) {
 }
 
 void app_main(void) {
-    nvs_flash_init(); ledc_init();
+    nvs_flash_init();
     
     load_config();
     esp_netif_init(); esp_event_loop_create_default();
