@@ -55,7 +55,7 @@ extern const uint8_t mqtt_ca_pem_start[] asm("_binary_saudade_site_ca_pem_start"
 
 /* OTA：平台固件仓库（需与设备服务版本一致），上传新固件到控制台后自动升级 */
 #define OTA_INFO_URL    "https://saudade.site/device-api/api/ota/info"
-#define OTA_FW_URL      "https://saudade.site/device-api/api/ota/fw/OBC.bin"
+#define OTA_FW_URL      "https://saudade.site/device-api/api/ota/fw/current.bin"  /* current 可被平台回滚切换 */
 #define OTA_CHECK_MS    (6 * 60 * 60 * 1000)     /* 每 6 小时检查一次新固件 */
 
 /* 遥测上报周期 */
@@ -380,19 +380,7 @@ static void telemetry_task(void *arg)
     }
 }
 
-/* ---------------- OTA（平台固件仓库轮询升级） ---------------- */
-/* semver 比较："1.2.0" > "1.1.9"。返回 >0 表示 a>b */
-static int semver_cmp(const char *a, const char *b)
-{
-    int x[3] = {0}, y[3] = {0};
-    sscanf(a, "%d.%d.%d", &x[0], &x[1], &x[2]);
-    sscanf(b, "%d.%d.%d", &y[0], &y[1], &y[2]);
-    for (int i = 0; i < 3; i++) {
-        if (x[i] != y[i]) return x[i] - y[i];
-    }
-    return 0;
-}
-
+/* ---------------- OTA（平台固件仓库轮询升级/回滚） ---------------- */
 /* 拉取平台固件版本信息（HTTP Basic 设备认证） */
 static char *ota_fetch_version(void)
 {
@@ -434,8 +422,10 @@ static void ota_task(void *arg)
                 if (j) {
                     const cJSON *v = cJSON_GetObjectItemCaseSensitive(j, "version");
                     if (cJSON_IsString(v) && v->valuestring[0]) {
-                        if (semver_cmp(v->valuestring, APP_VERSION) > 0) {
-                            ESP_LOGI(TAG, "发现新固件 %s（当前 %s），开始升级…",
+                        /* 服务器 current 与本地版本不一致即刷（支持升级与回滚降级）；
+                           版本一致则跳过，避免重复刷写 */
+                        if (strcmp(v->valuestring, APP_VERSION) != 0) {
+                            ESP_LOGI(TAG, "平台固件 %s（本地 %s），开始升级/降级…",
                                      v->valuestring, APP_VERSION);
                             /* 带 Basic 认证下载固件（esp_https_ota 校验服务器证书） */
                             esp_http_client_config_t cc = {
