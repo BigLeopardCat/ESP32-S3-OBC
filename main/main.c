@@ -1,254 +1,540 @@
+/* ==========================================================
+ * OBC OLED IoT 显示固件 (ESP32-S3)
+ *
+ * 功能：
+ *   - 连接 WiFi (STA 模式)
+ *   - 通过 MQTT over TLS (mqtts://) 连接 IoT 平台
+ *   - 订阅指定 topic，收到消息后在 128x64 SPI OLED 上显示
+ *
+ * 硬件接线（与旧固件一致）：
+ *   CS=36  DC=37  RST=38  MOSI=39  CLK=40
+ *
+ * 需要修改的配置都在下方「配置区」，改完直接编译即可。
+ * 旧固件（网页配置/OTA/BLE）已备份在 main.c.bak。
+ * ========================================================== */
 #include <string.h>
-#include <sys/param.h>
+#include <stdio.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
-#include "nvs.h"
-#include "driver/ledc.h"
+#include "driver/spi_master.h"
 #include "driver/gpio.h"
-#include "esp_ota_ops.h"
-#include "esp_partition.h"
-#include "esp_http_server.h"
-#include "esp_http_client.h"
-#include "esp_https_ota.h"
-#include "lwip/sockets.h"
-#include "lwip/dns.h"
-#include "lwip/netdb.h"
-#include "esp_rom_sys.h"
+#include "mqtt_client.h"
+#include "cJSON.h"
 
-#define TAG "OBC_PRO"
-#define BOOT_BUTTON_GPIO    0
-#define DEFAULT_SSID   "OBC_Device"
-#define WEB_PASSWORD   "admin"
+/* 服务器证书链，由 EMBED_TXTFILES 嵌入固件（见 main/CMakeLists.txt） */
+extern const uint8_t mqtt_ca_pem_start[] asm("_binary_saudade_site_ca_pem_start");
 
-/* Global State */
-static bool s_wifi_master_on = false;
-static bool s_in_ap_mode = false;
-static bool s_web_authenticated = false;
-static httpd_handle_t s_http_server = NULL;
-static char wifi_ssid[33] = {0};
-static char wifi_pass[65] = {0};
+/* ===================== 配置区（修改这里） ===================== */
+/* 你的 WiFi */
+#define WIFI_SSID       "别找我喵"
+#define WIFI_PASS       "meowmeow"
 
-/* --- NVS --- */
-void save_config(void) {
-    nvs_handle_t h;
-    if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_str(h, "ssid", wifi_ssid); nvs_set_str(h, "pass", wifi_pass);
-        nvs_commit(h); nvs_close(h);
+/* IoT 平台接入：
+ *   1. 浏览器打开 https://saudade.site/device-console/（需登录博客）
+ *   2. 注册设备，把返回的 device_id / device_key 填到下面（key 仅显示一次） */
+#define MQTT_URI        "mqtts://saudade.site:8883"
+#define DEVICE_ID       "dev-52ff0c8906344627bdf01a480bfd3952"   /* ← 控制台注册返回的 device_id */
+#define DEVICE_KEY      "dk-caf399a4633442a5a28ccdc733413cd9"    /* ← 控制台注册返回的 device_key */
+#define MQTT_USER       DEVICE_ID                /* 设备认证用户名 = device_id */
+#define MQTT_PASS       DEVICE_KEY               /* 设备认证密码 = device_key */
+#define MQTT_TOPIC      "devices/" DEVICE_ID "/cmd"  /* 指令通道：{"type":"display","text":"..."} */
+#define MQTT_KEEPALIVE  60
+/* ============================================================= */
+
+#define TAG "OLED_IOT"
+
+/* OLED SPI 引脚 */
+#define OLED_PIN_CS    36
+#define OLED_PIN_DC    37
+#define OLED_PIN_RST   38
+#define OLED_PIN_MOSI  39
+#define OLED_PIN_CLK   40
+#define OLED_H_RES     128
+#define OLED_V_RES     64
+
+/* 5x7 ASCII 字体：每字符 5 字节（每字节一列），bit0 为最上行 */
+#define FONT_W          5
+#define FONT_H          7
+#define CHAR_ADV        (FONT_W + 1)               /* 字符步进（含 1px 间距） */
+#define CHARS_PER_LINE  (OLED_H_RES / CHAR_ADV)    /* 每行字符数 = 21 */
+#define MAX_LINES       (OLED_V_RES / (FONT_H + 1))/* 最多行数 = 8 */
+
+static spi_device_handle_t s_spi;
+static uint8_t s_fb[OLED_H_RES * OLED_V_RES / 8];  /* 128x64 帧缓冲（内部 RAM，DMA 可用） */
+static SemaphoreHandle_t s_disp_mutex;
+static volatile bool s_wifi_connected = false;
+static esp_mqtt_client_handle_t s_mqtt = NULL;
+
+/* ---------------- SSD1306 底层 (SPI) ---------------- */
+static void oled_cmd(uint8_t cmd)
+{
+    gpio_set_level((gpio_num_t)OLED_PIN_DC, 0);
+    spi_transaction_t t = { .length = 8, .tx_buffer = &cmd };
+    spi_device_polling_transmit(s_spi, &t);
+}
+
+static void oled_data(const uint8_t *data, int len)
+{
+    if (len <= 0) return;
+    gpio_set_level((gpio_num_t)OLED_PIN_DC, 1);
+    spi_transaction_t t = { .length = (size_t)len * 8, .tx_buffer = data };
+    spi_device_polling_transmit(s_spi, &t);
+}
+
+static void fb_clear(void)
+{
+    memset(s_fb, 0, sizeof(s_fb));
+}
+
+static void fb_pixel(int x, int y)
+{
+    if (x < 0 || x >= OLED_H_RES || y < 0 || y >= OLED_V_RES) return;
+    s_fb[(y >> 3) * OLED_H_RES + x] |= (1 << (y & 7));
+}
+
+/* 整帧刷屏（page 寻址，8 页 × 128 字节） */
+static void oled_flush(void)
+{
+    for (int p = 0; p < 8; p++) {
+        oled_cmd(0xB0 | p);   /* 设置页地址 */
+        oled_cmd(0x00);       /* 列地址低 4 位 */
+        oled_cmd(0x10);       /* 列地址高 4 位 */
+        oled_data(&s_fb[p * OLED_H_RES], OLED_H_RES);
     }
 }
-void load_config(void) {
-    nvs_handle_t h;
-    if (nvs_open("storage", NVS_READONLY, &h) == ESP_OK) {
-        size_t len=sizeof(wifi_ssid); if(nvs_get_str(h, "ssid", wifi_ssid, &len)!=ESP_OK) wifi_ssid[0]=0;
-        len=sizeof(wifi_pass); if(nvs_get_str(h, "pass", wifi_pass, &len)!=ESP_OK) wifi_pass[0]=0;
-        nvs_close(h);
-    }
-}
 
-/* --- OTA & Web Util --- */
-void remote_ota_task(void *pvParameter) {
-    char *url = (char *)pvParameter;
-    esp_http_client_config_t cc = { .url = url, .keep_alive_enable = true, .skip_cert_common_name_check = true };
-    esp_https_ota_config_t oc = { .http_config = &cc };
-    if (esp_https_ota(&oc) == ESP_OK) esp_restart();
-    free(url); vTaskDelete(NULL);
-}
-void parse_param(char *buf, const char *key, char *dest, int max_len) {
-    char *p = strstr(buf, key); if (!p) return;
-    p += strlen(key); if (*p == '=') p++;
-    int i = 0; while (*p && *p != '&' && i < max_len-1) dest[i++] = *p++; dest[i] = 0;
-}
+/* ---------------- 5x7 ASCII 字体（经典 glcdfont） ---------------- */
+static const uint8_t font5x7[95][FONT_W] = {
+    {0x00,0x00,0x00,0x00,0x00}, /*   */
+    {0x00,0x00,0x5F,0x00,0x00}, /* ! */
+    {0x00,0x07,0x00,0x07,0x00}, /* " */
+    {0x14,0x7F,0x14,0x7F,0x14}, /* # */
+    {0x24,0x2A,0x7F,0x2A,0x12}, /* $ */
+    {0x23,0x13,0x08,0x64,0x62}, /* % */
+    {0x36,0x49,0x55,0x22,0x50}, /* & */
+    {0x00,0x05,0x03,0x00,0x00}, /* ' */
+    {0x00,0x1C,0x22,0x41,0x00}, /* ( */
+    {0x00,0x41,0x22,0x1C,0x00}, /* ) */
+    {0x08,0x2A,0x1C,0x2A,0x08}, /* * */
+    {0x08,0x08,0x3E,0x08,0x08}, /* + */
+    {0x00,0x50,0x30,0x00,0x00}, /* , */
+    {0x08,0x08,0x08,0x08,0x08}, /* - */
+    {0x00,0x60,0x60,0x00,0x00}, /* . */
+    {0x20,0x10,0x08,0x04,0x02}, /* / */
+    {0x3E,0x51,0x49,0x45,0x3E}, /* 0 */
+    {0x00,0x42,0x7F,0x40,0x00}, /* 1 */
+    {0x42,0x61,0x51,0x49,0x46}, /* 2 */
+    {0x21,0x41,0x45,0x4B,0x31}, /* 3 */
+    {0x18,0x14,0x12,0x7F,0x10}, /* 4 */
+    {0x27,0x45,0x45,0x45,0x39}, /* 5 */
+    {0x3C,0x4A,0x49,0x49,0x30}, /* 6 */
+    {0x01,0x71,0x09,0x05,0x03}, /* 7 */
+    {0x36,0x49,0x49,0x49,0x36}, /* 8 */
+    {0x06,0x49,0x49,0x29,0x1E}, /* 9 */
+    {0x00,0x36,0x36,0x00,0x00}, /* : */
+    {0x00,0x56,0x36,0x00,0x00}, /* ; */
+    {0x00,0x08,0x14,0x22,0x41}, /* < */
+    {0x14,0x14,0x14,0x14,0x14}, /* = */
+    {0x41,0x22,0x14,0x08,0x00}, /* > */
+    {0x02,0x01,0x51,0x09,0x06}, /* ? */
+    {0x32,0x49,0x79,0x41,0x3E}, /* @ */
+    {0x7E,0x11,0x11,0x11,0x7E}, /* A */
+    {0x7F,0x49,0x49,0x49,0x36}, /* B */
+    {0x3E,0x41,0x41,0x41,0x22}, /* C */
+    {0x7F,0x41,0x41,0x22,0x1C}, /* D */
+    {0x7F,0x49,0x49,0x49,0x41}, /* E */
+    {0x7F,0x09,0x09,0x01,0x01}, /* F */
+    {0x3E,0x41,0x41,0x51,0x32}, /* G */
+    {0x7F,0x08,0x08,0x08,0x7F}, /* H */
+    {0x00,0x41,0x7F,0x41,0x00}, /* I */
+    {0x20,0x40,0x41,0x3F,0x01}, /* J */
+    {0x7F,0x08,0x14,0x22,0x41}, /* K */
+    {0x7F,0x40,0x40,0x40,0x40}, /* L */
+    {0x7F,0x02,0x04,0x02,0x7F}, /* M */
+    {0x7F,0x04,0x08,0x10,0x7F}, /* N */
+    {0x3E,0x41,0x41,0x41,0x3E}, /* O */
+    {0x7F,0x09,0x09,0x09,0x06}, /* P */
+    {0x3E,0x41,0x51,0x21,0x5E}, /* Q */
+    {0x7F,0x09,0x19,0x29,0x46}, /* R */
+    {0x46,0x49,0x49,0x49,0x31}, /* S */
+    {0x01,0x01,0x7F,0x01,0x01}, /* T */
+    {0x3F,0x40,0x40,0x40,0x3F}, /* U */
+    {0x1F,0x20,0x40,0x20,0x1F}, /* V */
+    {0x7F,0x20,0x18,0x20,0x7F}, /* W */
+    {0x63,0x14,0x08,0x14,0x63}, /* X */
+    {0x03,0x04,0x78,0x04,0x03}, /* Y */
+    {0x61,0x51,0x49,0x45,0x43}, /* Z */
+    {0x00,0x00,0x7F,0x41,0x41}, /* [ */
+    {0x02,0x04,0x08,0x10,0x20}, /* \ */
+    {0x41,0x41,0x7F,0x00,0x00}, /* ] */
+    {0x04,0x02,0x01,0x02,0x04}, /* ^ */
+    {0x40,0x40,0x40,0x40,0x40}, /* _ */
+    {0x00,0x01,0x02,0x04,0x00}, /* ` */
+    {0x20,0x54,0x54,0x54,0x78}, /* a */
+    {0x7F,0x48,0x44,0x44,0x38}, /* b */
+    {0x38,0x44,0x44,0x44,0x20}, /* c */
+    {0x38,0x44,0x44,0x48,0x7F}, /* d */
+    {0x38,0x54,0x54,0x54,0x18}, /* e */
+    {0x08,0x7E,0x09,0x01,0x02}, /* f */
+    {0x0C,0x52,0x52,0x52,0x3E}, /* g */
+    {0x7F,0x08,0x04,0x04,0x78}, /* h */
+    {0x00,0x44,0x7D,0x40,0x00}, /* i */
+    {0x20,0x40,0x44,0x3D,0x00}, /* j */
+    {0x7F,0x10,0x28,0x44,0x00}, /* k */
+    {0x00,0x41,0x7F,0x40,0x00}, /* l */
+    {0x7C,0x04,0x18,0x04,0x78}, /* m */
+    {0x7C,0x08,0x04,0x04,0x78}, /* n */
+    {0x38,0x44,0x44,0x44,0x38}, /* o */
+    {0x7C,0x14,0x14,0x14,0x08}, /* p */
+    {0x08,0x14,0x14,0x18,0x7C}, /* q */
+    {0x7C,0x08,0x04,0x04,0x08}, /* r */
+    {0x48,0x54,0x54,0x54,0x20}, /* s */
+    {0x04,0x3F,0x44,0x40,0x20}, /* t */
+    {0x3C,0x40,0x40,0x20,0x7C}, /* u */
+    {0x1C,0x20,0x40,0x20,0x1C}, /* v */
+    {0x3C,0x40,0x30,0x40,0x3C}, /* w */
+    {0x44,0x28,0x10,0x28,0x44}, /* x */
+    {0x0C,0x50,0x50,0x50,0x3C}, /* y */
+    {0x44,0x64,0x54,0x4C,0x44}, /* z */
+    {0x00,0x08,0x36,0x41,0x00}, /* { */
+    {0x00,0x00,0x7F,0x00,0x00}, /* | */
+    {0x00,0x41,0x36,0x08,0x00}, /* } */
+    {0x08,0x04,0x08,0x10,0x08}, /* ~ */
+};
 
-/* --- Web UI --- */
-const char* HTML_HEAD = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=0'><style>\
-:root{--bg:#f2f2f7;--card:#fff;--txt:#000;--hl:#007aff} @media(prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--txt:#fff;--hl:#0a84ff}}\
-body{font-family:-apple-system,system-ui,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:20px;}\
-.card{background:var(--card);border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,0.05)}\
-h2{margin:0 0 10px;font-size:22px} input,button{width:100%;box-sizing:border-box;margin:5px 0;padding:12px;border-radius:8px;border:1px solid #ddd;font-size:16px}\
-button{background:var(--hl);color:#fff;border:none;font-weight:600} input[type=range]{height:6px;padding:0}\
-input[type=color]{height:50px;padding:0;overflow:hidden;border:none}\
-</style><script>function p(u,d){fetch(u,{method:'POST',body:d})} function g(id){return document.getElementById(id)}\
-function D(v){p('/api/d?v='+v)} function C(v){p('/api/c?v='+v.replace('#',''))} function W(){g('wf').submit()}\
-function UF(){var f=g('f').files[0];if(!f)return;var d=new FormData();d.append('f',f);g('ub').innerText='Uploading...';fetch('/ota',{method:'POST',body:d}).then(r=>{r.ok?location.reload():alert('Error')})}\
-function UR(){var u=g('ur').value;if(u){var d=new FormData();d.append('u',u);p('/ota/remote',d);alert('Starting Update...')}}\
-</script></head><body>";
-
-static esp_err_t login_handler(httpd_req_t *req) {
-    char buf[128]; int ret=httpd_req_recv(req,buf,sizeof(buf)-1); if(ret<=0)return ESP_FAIL; buf[ret]=0;
-    char pwd[64]={0}; parse_param(buf,"password",pwd,sizeof(pwd));
-    if(strcmp(pwd,WEB_PASSWORD)==0) {
-        s_web_authenticated=true; httpd_resp_set_status(req,"302 Found"); httpd_resp_set_hdr(req,"Location","/"); httpd_resp_send(req,NULL,0);
-    } else {
-        httpd_resp_send_chunk(req, HTML_HEAD, HTTPD_RESP_USE_STRLEN);
-        httpd_resp_send_chunk(req, "<div class='card'><h2>Error</h2><p>Wrong Password</p><a href='/'>Retry</a></div>", HTTPD_RESP_USE_STRLEN);
-        httpd_resp_send_chunk(req, NULL, 0);
-    }
-    return ESP_OK;
-}
-static esp_err_t root_handler(httpd_req_t *req) {
-    if(!s_web_authenticated) {
-        httpd_resp_send_chunk(req, HTML_HEAD, HTTPD_RESP_USE_STRLEN);
-        httpd_resp_send_chunk(req, "<div class='card' style='margin-top:20vh'><h2>Login</h2><form action='/login' method='post'><input name='password' type='password' placeholder='Password'><button>Enter</button></form></div>", HTTPD_RESP_USE_STRLEN);
-        httpd_resp_send_chunk(req, NULL, 0); 
-        return ESP_OK;
-    }
-    
-    char buf[512]; 
-    httpd_resp_send_chunk(req, HTML_HEAD, HTTPD_RESP_USE_STRLEN);
-
-    /* Section 2: WiFi */
-    snprintf(buf, sizeof(buf), "<div class='card'><h3>WiFi</h3><form id='wf' action='/api/w' method='post'><input name='s' value='%s' placeholder='SSID'><input name='p' value='%s' placeholder='Pass'></form><button onclick='W()'>Save & Connect</button></div>", 
-             wifi_ssid, wifi_pass);
-    httpd_resp_send_chunk(req, buf, HTTPD_RESP_USE_STRLEN);
-    
-    /* Section 3: Update + End */
-    httpd_resp_send_chunk(req, "<div class='card'><h3>Update</h3><input type='file' id='f'><button id='ub' onclick='UF()'>Local Flash</button><hr><input id='ur' placeholder='http://url/fw.bin'><button onclick='UR()'>Remote Flash</button></div></body></html>", HTTPD_RESP_USE_STRLEN);
-    
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
-}
-static esp_err_t captive_portal_handler(httpd_req_t *req) {
-    httpd_resp_set_status(req, "302 Found"); httpd_resp_set_hdr(req, "Location", "/"); httpd_resp_send(req, NULL, 0); return ESP_OK;
-}
-
-static esp_err_t api_handler(httpd_req_t *req) {
-    char buf[256]; char type=req->uri[5];
-    if(type=='w') { /* WiFi */
-        int ret=httpd_req_recv(req, buf, sizeof(buf)-1); if(ret>0){ buf[ret]=0; parse_param(buf,"s",wifi_ssid,sizeof(wifi_ssid)); parse_param(buf,"p",wifi_pass,sizeof(wifi_pass)); save_config(); }
-        httpd_resp_send(req,"Saved.",-1);
-    } return ESP_OK;
-}
-static esp_err_t ota_handler(httpd_req_t *req) {
-    esp_ota_handle_t h; const esp_partition_t *p = esp_ota_get_next_update_partition(NULL);
-    if (!p || esp_ota_begin(p, OTA_SIZE_UNKNOWN, &h)!=ESP_OK) { httpd_resp_send_500(req); return ESP_FAIL; }
-    char *buf = malloc(1024); int r, rem=req->content_len;
-    while(rem>0 && (r=httpd_req_recv(req, buf, MIN(rem,1024)))>0) { esp_ota_write(h, buf, r); rem-=r; }
-    free(buf); esp_ota_end(h); esp_ota_set_boot_partition(p); httpd_resp_send(req,"OK",2); vTaskDelay(100); esp_restart(); return ESP_OK;
-}
-static esp_err_t ota_remote_trigger_handler(httpd_req_t *req) {
-    char buf[256]; int ret=httpd_req_recv(req, buf, sizeof(buf)-1); if(ret>0){ buf[ret]=0; char url[128]={0}; parse_param(buf,"u",url,sizeof(url)); xTaskCreate(remote_ota_task, "rota", 8192, strdup(url), 5, NULL); }
-    httpd_resp_send(req,"OK",2); return ESP_OK;
-}
-
-/* --- Core Logic --- */
-static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
-        ESP_LOGI(TAG, "Station connected to AP");
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if(s_wifi_master_on && !s_in_ap_mode) { ESP_LOGI(TAG, "STA Disconnected, retrying..."); esp_wifi_connect(); }
-    }
-}
-void connect_sta(void) {
-    ESP_LOGI(TAG, "Switching to STA Mode...");
-    wifi_config_t c={0}; strncpy((char*)c.sta.ssid,wifi_ssid,32); strncpy((char*)c.sta.password,wifi_pass,64);
-    esp_wifi_set_mode(WIFI_MODE_STA); esp_wifi_set_config(WIFI_IF_STA,&c); 
-    esp_wifi_start(); esp_wifi_connect();
-}
-void start_ap(void) {
-    if(s_in_ap_mode) return;
-    ESP_LOGI(TAG, "Switching to AP Mode...");
-    esp_wifi_disconnect(); esp_wifi_stop();
-    wifi_config_t c = { .ap = { .ssid=DEFAULT_SSID, .ssid_len=strlen(DEFAULT_SSID), .max_connection=4, .authmode=WIFI_AUTH_OPEN } };
-    esp_wifi_set_mode(WIFI_MODE_AP); esp_wifi_set_config(WIFI_IF_AP, &c); esp_wifi_start();
-    
-    httpd_config_t h = HTTPD_DEFAULT_CONFIG(); 
-    h.max_uri_handlers = 13; 
-    h.stack_size = 8192; 
-    h.uri_match_fn = httpd_uri_match_wildcard;
-    h.lru_purge_enable = true; // Clean up old connections
-    
-    httpd_start(&s_http_server, &h);
-    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/",.method=HTTP_GET,.handler=root_handler});
-    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/login",.method=HTTP_POST,.handler=login_handler});
-    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/api/w",.method=HTTP_POST,.handler=api_handler});
-    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/ota",.method=HTTP_POST,.handler=ota_handler});
-    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/ota/remote",.method=HTTP_POST,.handler=ota_remote_trigger_handler});
-    
-    // Catch-all handlers for Captive Portal (MUST be last)
-    // Handle both GET and POST to avoid "Method not allowed" spam from background apps
-    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/*",.method=HTTP_GET,.handler=captive_portal_handler});
-    httpd_register_uri_handler(s_http_server, &(httpd_uri_t){.uri="/*",.method=HTTP_POST,.handler=captive_portal_handler}); 
-
-    s_in_ap_mode=true; s_web_authenticated=false;
-}
-void stop_ap(void) {
-    if(!s_in_ap_mode) return;
-    ESP_LOGI(TAG, "Stopping AI Mode...");
-    save_config(); if(s_http_server) { httpd_stop(s_http_server); s_http_server=NULL; }
-    s_in_ap_mode=false;
-    if(s_wifi_master_on) connect_sta(); else esp_wifi_stop();
-}
-void master_toggle(void) {
-    s_wifi_master_on = !s_wifi_master_on;
-    ESP_LOGI(TAG, "Master Switch: %d", s_wifi_master_on);
-    if(s_wifi_master_on) { if(!s_in_ap_mode) connect_sta(); } else { if(s_in_ap_mode) stop_ap(); else esp_wifi_stop(); }
-}
-
-/* --- Tasks --- */
-void dns_task(void *pvParameters) {
-    uint8_t d[512]; struct sockaddr_in s_addr, c_addr; socklen_t l=sizeof(c_addr); 
-    int s = socket(AF_INET, SOCK_DGRAM, 0); struct timeval tv={.tv_sec=1}; setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
-    memset(&s_addr,0,sizeof(s_addr)); s_addr.sin_family=AF_INET; s_addr.sin_addr.s_addr=htonl(INADDR_ANY); s_addr.sin_port=htons(53);
-    bind(s, (struct sockaddr *)&s_addr, sizeof(s_addr));
-    while(1) {
-        if(s_in_ap_mode) {
-            int len = recvfrom(s, d, sizeof(d), 0, (struct sockaddr *)&c_addr, &l);
-            if(len>12) {
-                d[2]|=0x80; d[3]|=0x80; d[7]=1; 
-                int idx=12; 
-                while(idx < len && d[idx]!=0) { 
-                    int label_len = d[idx];
-                    if(idx + label_len + 1 >= len) break;
-                    idx += label_len + 1; 
-                } 
-                idx+=5; 
-                if(idx+16<sizeof(d)) {
-                     d[idx++]=0xC0; d[idx++]=0x0C; d[idx++]=0x00; d[idx++]=0x01; d[idx++]=0x00; d[idx++]=0x01; 
-                     d[idx++]=0x00; d[idx++]=0x00; d[idx++]=0x00; d[idx++]=0x3C; d[idx++]=0x00; d[idx++]=0x04;
-                     d[idx++]=192; d[idx++]=168; d[idx++]=4; d[idx++]=1;
-                     sendto(s, d, idx, 0, (struct sockaddr *)&c_addr, sizeof(c_addr));
-                }
-            }
-        } else { vTaskDelay(pdMS_TO_TICKS(500)); }
-    }
-}
-void btn_task(void*z) {
-    gpio_config_t c={.pin_bit_mask=(1ULL<<BOOT_BUTTON_GPIO), .mode=GPIO_MODE_INPUT, .pull_up_en=1}; gpio_config(&c);
-    int cnt=0; bool p=0;
-    while(1) {
-        if(gpio_get_level(BOOT_BUTTON_GPIO)==0) {
-            if(!p) { p=1; cnt=0; ESP_LOGI(TAG,"Button Press Detected"); }
-            if(p) { if(++cnt > 150) { master_toggle(); cnt=-1000; } } 
-        } else {
-            if(p && cnt>0 && cnt!=-1000) { 
-                if(s_wifi_master_on) { 
-                    if(s_in_ap_mode) { ESP_LOGI(TAG, "Command: Switch to STA"); stop_ap(); }
-                    else { ESP_LOGI(TAG, "Command: Switch to AP"); start_ap(); }
-                } else {
-                     ESP_LOGW(TAG, "WiFi Master is OFF. Long press to enable.");
-                }
-            }
-            p=0; cnt=0;
+/* ---------------- 文字绘制 ---------------- */
+/* 画一个字符，返回下一个字符的 x 坐标；非 ASCII 显示为 ? */
+static int draw_char(int x, int y, char c)
+{
+    if (c < 0x20 || c > 0x7E) c = '?';
+    const uint8_t *g = font5x7[c - 0x20];
+    for (int col = 0; col < FONT_W; col++) {
+        for (int row = 0; row < FONT_H; row++) {
+            if (g[col] & (1 << row)) fb_pixel(x + col, y + row);
         }
-        vTaskDelay(20/portTICK_PERIOD_MS);
+    }
+    return x + CHAR_ADV;
+}
+
+/* 画一行文本（水平居中） */
+static void draw_line_centered(const char *text, int y)
+{
+    int w = strlen(text) * CHAR_ADV;
+    if (w > OLED_H_RES) w = OLED_H_RES;
+    int x = (OLED_H_RES - w) / 2;
+    if (x < 0) x = 0;
+    for (; *text; text++) x = draw_char(x, y, *text);
+}
+
+/* 状态显示：多行文本（\n 分隔），每行居中，最多 8 行 */
+static void oled_show_lines(const char *lines)
+{
+    if (s_disp_mutex) xSemaphoreTake(s_disp_mutex, portMAX_DELAY);
+    fb_clear();
+    int y = 0;
+    const char *p = lines;
+    while (*p && y < OLED_V_RES) {
+        const char *e = p;
+        while (*e && *e != '\n') e++;
+        int n = (e - p < CHARS_PER_LINE) ? (int)(e - p) : CHARS_PER_LINE;
+        char tmp[CHARS_PER_LINE + 1];
+        memcpy(tmp, p, n);
+        tmp[n] = 0;
+        draw_line_centered(tmp, y);
+        y += FONT_H + 1;
+        p = (*e == '\n') ? e + 1 : e;
+    }
+    oled_flush();
+    if (s_disp_mutex) xSemaphoreGive(s_disp_mutex);
+}
+
+/* 消息显示：自动换行（尽量不切断单词），每行居中 */
+static void oled_show_message(const char *msg)
+{
+    if (s_disp_mutex) xSemaphoreTake(s_disp_mutex, portMAX_DELAY);
+    fb_clear();
+    int y = 0;
+    const char *p = msg;
+    while (*p && y < OLED_V_RES) {
+        int n = 0;
+        while (p[n] && p[n] != '\n' && n < CHARS_PER_LINE) n++;
+        bool forced = (n == CHARS_PER_LINE) && p[n] && p[n] != '\n';
+        if (forced) {   /* 行尾回退到最后一个空格，避免切断单词 */
+            int sp = n;
+            while (sp > 0 && p[sp - 1] != ' ') sp--;
+            if (sp > 0) n = sp;
+        }
+        char tmp[CHARS_PER_LINE + 1];
+        memcpy(tmp, p, n);
+        tmp[n] = 0;
+        draw_line_centered(tmp, y);
+        y += FONT_H + 1;
+        p += n;
+        if (*p == ' ' || *p == '\n') p++;
+    }
+    oled_flush();
+    if (s_disp_mutex) xSemaphoreGive(s_disp_mutex);
+}
+
+/* ---------------- MQTT ---------------- */
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
+                               int32_t event_id, void *event_data);
+
+/* 打印 JSON 里的每个字段（变量名 = 数值），用于调试服务器下发的新参数 */
+static void log_json_fields(const cJSON *obj)
+{
+    for (const cJSON *it = obj->child; it; it = it->next) {
+        switch (it->type & 0xFF) {
+        case cJSON_String:  ESP_LOGI(TAG, "  \"%s\" = \"%s\"", it->string, it->valuestring); break;
+        case cJSON_Number:  ESP_LOGI(TAG, "  \"%s\" = %g", it->string, it->valuedouble); break;
+        case cJSON_True:    ESP_LOGI(TAG, "  \"%s\" = true", it->string); break;
+        case cJSON_False:   ESP_LOGI(TAG, "  \"%s\" = false", it->string); break;
+        case cJSON_NULL:    ESP_LOGI(TAG, "  \"%s\" = null", it->string); break;
+        case cJSON_Array:   ESP_LOGI(TAG, "  \"%s\" = [array x%d]", it->string, cJSON_GetArraySize(it)); break;
+        case cJSON_Object:  ESP_LOGI(TAG, "  \"%s\" = {object}", it->string); break;
+        default:            ESP_LOGI(TAG, "  \"%s\" = ?", it->string); break;
+        }
     }
 }
 
-void app_main(void) {
-    nvs_flash_init();
-    
-    load_config();
-    esp_netif_init(); esp_event_loop_create_default();
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-    esp_netif_create_default_wifi_sta(); esp_netif_create_default_wifi_ap();
-    wifi_init_config_t c=WIFI_INIT_CONFIG_DEFAULT(); esp_wifi_init(&c);
+static void mqtt_start(void)
+{
+    if (s_mqtt) return;
+    esp_mqtt_client_config_t cfg = {
+        .broker = {
+            .address = {
+                .uri = MQTT_URI,
+            },
+            .verification = {
+                .certificate = (const char *)mqtt_ca_pem_start,  /* 校验证书链 */
+            },
+        },
+        .credentials = {
+            .username = MQTT_USER,
+            .authentication = {
+                .password = MQTT_PASS,
+            },
+        },
+        .session = {
+            .keepalive = MQTT_KEEPALIVE,
+        },
+    };
+    s_mqtt = esp_mqtt_client_init(&cfg);
+    esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt);
+}
 
-    xTaskCreate(dns_task, "dns", 4096, NULL, 5, NULL);
-    xTaskCreate(btn_task, "btn", 4096, NULL, 5, NULL);
-    ESP_LOGI(TAG, "Device Ready.");
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+    char buf[96];   /* 装得下 "MQTT Connected\nsub: " + 48字节的完整 topic */
+
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT connected, subscribing to \"%s\"", MQTT_TOPIC);
+        esp_mqtt_client_subscribe(s_mqtt, MQTT_TOPIC, 0);
+        snprintf(buf, sizeof(buf), "MQTT Connected\nsub: %s", MQTT_TOPIC);
+        oled_show_lines(buf);
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "MQTT disconnected, reconnecting...");
+        oled_show_lines("MQTT Disconnected\nReconnecting...");
+        break;
+
+    case MQTT_EVENT_DATA: {
+        /* 只处理订阅主题的消息（指令通道） */
+        if (event->topic_len != (int)strlen(MQTT_TOPIC) ||
+            strncmp(event->topic, MQTT_TOPIC, event->topic_len) != 0) break;
+
+        /* 收到的每条消息都完整打印，方便调试 */
+        ESP_LOGI(TAG, "rx [%.*s] %.*s",
+                 event->topic_len, event->topic,
+                 event->data_len, event->data);
+
+        /* 指令 JSON：{"type":"display","text":"..."}，text 含 \n 可换行 */
+        static char buf[512];
+        size_t len = event->data_len;
+        if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+        memcpy(buf, event->data, len);
+        buf[len] = 0;
+
+        cJSON *root = cJSON_Parse(buf);
+        if (!root) { ESP_LOGW(TAG, "指令 JSON 解析失败: %s", buf); break; }
+
+        /* 解析成功则逐字段打印：变量名 = 数值 */
+        log_json_fields(root);
+
+        const cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+        const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
+        if (cJSON_IsString(type) && strcmp(type->valuestring, "display") == 0
+            && cJSON_IsString(text)) {
+            ESP_LOGI(TAG, "display: %s", text->valuestring);
+            oled_show_message(text->valuestring);
+            /* 回执：控制台页实时显示"设备已确认" */
+            char ack_topic[96], ack[64];
+            snprintf(ack_topic, sizeof(ack_topic), "devices/%s/cmd/ack", DEVICE_ID);
+            snprintf(ack, sizeof(ack), "{\"ack\":true,\"type\":\"display\"}");
+            esp_mqtt_client_publish(s_mqtt, ack_topic, ack, 0, 1, 0);
+        }
+        cJSON_Delete(root);
+        break;
+    }
+
+    case MQTT_EVENT_ERROR:
+        if (event->error_handle) {
+            ESP_LOGE(TAG, "MQTT error, type=%d", event->error_handle->error_type);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* ---------------- WiFi ---------------- */
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    if (base == WIFI_EVENT) {
+        switch (event_id) {
+        case WIFI_EVENT_STA_START:
+            esp_wifi_connect();
+            break;
+
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            wifi_event_sta_disconnected_t *e = event_data;
+            ESP_LOGW(TAG, "WiFi disconnected, reason=%d", e->reason);
+            s_wifi_connected = false;
+            oled_show_lines("WiFi Lost\nRetrying...");
+            break;
+        }
+        default:
+            break;
+        }
+    } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = event_data;
+        s_wifi_connected = true;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "WiFi OK\nIP: " IPSTR, IP2STR(&e->ip_info.ip));
+        ESP_LOGI(TAG, "Got IP " IPSTR, IP2STR(&e->ip_info.ip));
+        oled_show_lines(buf);
+        mqtt_start();   /* 拿到 IP 后启动 MQTT */
+    }
+}
+
+/* 断线自动重连（每 5 秒尝试一次） */
+static void wifi_retry_task(void *arg)
+{
+    while (1) {
+        if (!s_wifi_connected) {
+            esp_wifi_connect();   /* 失败返回错误码也无妨，下轮再试 */
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+/* ---------------- 主入口 ---------------- */
+void app_main(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    /* ---- OLED SPI 初始化（同旧固件） ---- */
+    spi_bus_config_t bus_cfg = {
+        .sclk_io_num = OLED_PIN_CLK,
+        .mosi_io_num = OLED_PIN_MOSI,
+        .miso_io_num = -1,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = OLED_H_RES * OLED_V_RES,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 10 * 1000 * 1000,
+        .mode = 0,
+        .spics_io_num = OLED_PIN_CS,
+        .queue_size = 7,
+    };
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &s_spi));
+
+    gpio_set_direction((gpio_num_t)OLED_PIN_DC, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)OLED_PIN_RST, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)OLED_PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level((gpio_num_t)OLED_PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    oled_cmd(0xAE); // display off
+    oled_cmd(0x20); // Set Memory Addressing Mode
+    oled_cmd(0x02); // 02=Page Addressing Mode
+    oled_cmd(0xB0); // Set Page Start Address
+    oled_cmd(0xC8); // Set COM Output Scan Direction
+    oled_cmd(0x00); // set low column address
+    oled_cmd(0x10); // set high column address
+    oled_cmd(0x40); // set start line address
+    oled_cmd(0x81); // set contrast control register
+    oled_cmd(0xFF);
+    oled_cmd(0xA1); // set segment re-map 0 to 127
+    oled_cmd(0xA6); // set normal display（若显示为反色，改成 0xA7）
+    oled_cmd(0xA8); // set multiplex ratio(1 to 64)
+    oled_cmd(0x3F);
+    oled_cmd(0xA4); // output follows RAM content
+    oled_cmd(0xD3); // set display offset
+    oled_cmd(0x00); // no offset
+    oled_cmd(0xD5); // set display clock divide ratio/oscillator frequency
+    oled_cmd(0xF0);
+    oled_cmd(0xD9); // set pre-charge period
+    oled_cmd(0x22);
+    oled_cmd(0xDA); // set com pins hardware configuration
+    oled_cmd(0x12);
+    oled_cmd(0xDB); // set vcomh
+    oled_cmd(0x20);
+    oled_cmd(0x8D); // set DC-DC enable
+    oled_cmd(0x14);
+    oled_cmd(0xAF); // display on
+
+    s_disp_mutex = xSemaphoreCreateMutex();
+    oled_show_lines("OBC OLED\nIoT Display");   /* 开机画面 */
+
+    /* ---- WiFi STA ---- */
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+
+    wifi_config_t wc = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    xTaskCreate(wifi_retry_task, "wifi_retry", 4096, NULL, 4, NULL);
+
+    char boot[96];
+    snprintf(boot, sizeof(boot), "WiFi Connecting\n%s", WIFI_SSID);
+    oled_show_lines(boot);
+
+    ESP_LOGI(TAG, "Ready. SSID=%s topic=%s", WIFI_SSID, MQTT_TOPIC);
 }

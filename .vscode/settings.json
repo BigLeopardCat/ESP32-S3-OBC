@@ -1,4 +1,5 @@
 {
+  "cmake.configureOnOpen": false,
   "C_Cpp.intelliSenseEngine": "default",
   "idf.espIdfPathWin": "C:\\Users\\cat\\esp\\v5.5.2\\esp-idf",
   "idf.pythonInstallPath": "C:\\Users\\cat\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
