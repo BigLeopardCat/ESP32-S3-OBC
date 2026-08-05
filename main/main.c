@@ -27,6 +27,10 @@
 #include "driver/gpio.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
+#include "esp_timer.h"
+#include <stdlib.h>
 
 /* 服务器证书链，由 EMBED_TXTFILES 嵌入固件（见 main/CMakeLists.txt） */
 extern const uint8_t mqtt_ca_pem_start[] asm("_binary_saudade_site_ca_pem_start");
@@ -44,8 +48,18 @@ extern const uint8_t mqtt_ca_pem_start[] asm("_binary_saudade_site_ca_pem_start"
 #define DEVICE_KEY      "dk-caf399a4633442a5a28ccdc733413cd9"    /* ← 控制台注册返回的 device_key */
 #define MQTT_USER       DEVICE_ID                /* 设备认证用户名 = device_id */
 #define MQTT_PASS       DEVICE_KEY               /* 设备认证密码 = device_key */
-#define MQTT_TOPIC      "devices/" DEVICE_ID "/cmd"  /* 指令通道：{"type":"display","text":"..."} */
 #define MQTT_KEEPALIVE  60
+
+/* 固件版本（OTA 比对用）：每次发版手动 +1，如 1.1.0 */
+#define APP_VERSION     "1.1.0"
+
+/* OTA：平台固件仓库（需与设备服务版本一致），上传新固件到控制台后自动升级 */
+#define OTA_INFO_URL    "https://saudade.site/device-api/api/ota/info"
+#define OTA_FW_URL      "https://saudade.site/device-api/api/ota/fw/OBC.bin"
+#define OTA_CHECK_MS    (6 * 60 * 60 * 1000)     /* 每 6 小时检查一次新固件 */
+
+/* 遥测上报周期 */
+#define TELEMETRY_MS    5000
 /* ============================================================= */
 
 #define TAG "OLED_IOT"
@@ -71,6 +85,11 @@ static uint8_t s_fb[OLED_H_RES * OLED_V_RES / 8];  /* 128x64 帧缓冲（内部 
 static SemaphoreHandle_t s_disp_mutex;
 static volatile bool s_wifi_connected = false;
 static esp_mqtt_client_handle_t s_mqtt = NULL;
+
+/* ---- 设备参数（网页控制台下发的 config，NVS 持久化） ---- */
+static int32_t  g_cfg_version  = 0;                 /* 当前生效配置版本 */
+static uint8_t  g_brightness   = 0xFF;              /* OLED 对比度 0-255 */
+static char     g_default_text[64] = "Hello OBC";   /* 空闲显示内容 */
 
 /* ---------------- SSD1306 底层 (SPI) ---------------- */
 static void oled_cmd(uint8_t cmd)
@@ -283,6 +302,169 @@ static void oled_show_message(const char *msg)
     if (s_disp_mutex) xSemaphoreGive(s_disp_mutex);
 }
 
+/* ---------------- 配置持久化（NVS） ---------------- */
+static void config_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("obc_cfg", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, "version", g_cfg_version);
+    nvs_set_u8(h, "bright", g_brightness);
+    nvs_set_str(h, "dtext", g_default_text);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void config_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("obc_cfg", NVS_READONLY, &h) != ESP_OK) return;
+    nvs_get_i32(h, "version", &g_cfg_version);
+    nvs_get_u8(h, "bright", &g_brightness);
+    size_t len = sizeof(g_default_text);
+    if (nvs_get_str(h, "dtext", g_default_text, &len) != ESP_OK) {
+        strcpy(g_default_text, "Hello OBC");
+    }
+    nvs_close(h);
+}
+
+/* 应用配置（网页下发）：brightness=OLED 对比度；default_text=空闲显示文本 */
+static void apply_config(const cJSON *cfg)
+{
+    const cJSON *b = cJSON_GetObjectItemCaseSensitive(cfg, "brightness");
+    const cJSON *t = cJSON_GetObjectItemCaseSensitive(cfg, "default_text");
+    bool changed = false;
+    if (cJSON_IsNumber(b)) {
+        uint8_t v = (uint8_t)(b->valueint & 0xFF);
+        if (v != g_brightness) { g_brightness = v; changed = true; }
+    }
+    if (cJSON_IsString(t) && t->valuestring[0]) {
+        if (strcmp(g_default_text, t->valuestring) != 0) {
+            snprintf(g_default_text, sizeof(g_default_text), "%s", t->valuestring);
+            changed = true;
+        }
+    }
+    /* 应用亮度（SSD1306 对比度指令） */
+    oled_cmd(0x81);
+    oled_cmd(g_brightness);
+    if (changed) config_save();
+    ESP_LOGI(TAG, "配置应用: brightness=%d default_text=%s",
+             g_brightness, g_default_text);
+}
+
+/* ---------------- 遥测 ---------------- */
+static void publish_telemetry(void)
+{
+    /* 模拟温湿度（OBC 演示用）；接真实传感器时替换 */
+    static float temp = 25.0f;
+    temp += ((rand() % 100) - 50) / 100.0f;
+
+    int rssi = 0;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
+
+    char topic[96], payload[256];
+    snprintf(topic, sizeof(topic), "devices/%s/telemetry", DEVICE_ID);
+    snprintf(payload, sizeof(payload),
+             "{\"cfg_version\":%d,\"firmware\":\"%s\",\"temperature\":%.1f,"
+             "\"rssi\":%d,\"uptime\":%u,\"brightness\":%d}",
+             g_cfg_version, APP_VERSION, temp, rssi,
+             (unsigned)(esp_timer_get_time() / 1000000), g_brightness);
+    esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
+}
+
+static void telemetry_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_MS));
+        if (s_mqtt && s_wifi_connected) publish_telemetry();
+    }
+}
+
+/* ---------------- OTA（平台固件仓库轮询升级） ---------------- */
+/* semver 比较："1.2.0" > "1.1.9"。返回 >0 表示 a>b */
+static int semver_cmp(const char *a, const char *b)
+{
+    int x[3] = {0}, y[3] = {0};
+    sscanf(a, "%d.%d.%d", &x[0], &x[1], &x[2]);
+    sscanf(b, "%d.%d.%d", &y[0], &y[1], &y[2]);
+    for (int i = 0; i < 3; i++) {
+        if (x[i] != y[i]) return x[i] - y[i];
+    }
+    return 0;
+}
+
+/* 拉取平台固件版本信息（HTTP Basic 设备认证） */
+static char *ota_fetch_version(void)
+{
+    esp_http_client_config_t cc = {
+        .url = OTA_INFO_URL,
+        .username = DEVICE_ID,
+        .password = DEVICE_KEY,
+        .timeout_ms = 8000,
+        .cert_pem = (const char *)mqtt_ca_pem_start,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cc);
+    if (!c) return NULL;
+    esp_err_t err = esp_http_client_open(c, 0);
+    if (err != ESP_OK) { esp_http_client_cleanup(c); return NULL; }
+    int len = esp_http_client_fetch_headers(c);
+    char *buf = NULL;
+    if (len > 0 && len < 512) {
+        buf = malloc(len + 1);
+        if (buf) {
+            int got = esp_http_client_read(c, buf, len);
+            if (got < 0) { free(buf); buf = NULL; }
+            else { buf[got] = 0; }
+        }
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    return buf;
+}
+
+static void ota_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(15000));   /* 启动 15s 后首次检查 */
+    for (;;) {
+        if (s_wifi_connected) {
+            char *info = ota_fetch_version();
+            if (info) {
+                cJSON *j = cJSON_Parse(info);
+                free(info);
+                if (j) {
+                    const cJSON *v = cJSON_GetObjectItemCaseSensitive(j, "version");
+                    if (cJSON_IsString(v) && v->valuestring[0]) {
+                        if (semver_cmp(v->valuestring, APP_VERSION) > 0) {
+                            ESP_LOGI(TAG, "发现新固件 %s（当前 %s），开始升级…",
+                                     v->valuestring, APP_VERSION);
+                            /* 带 Basic 认证下载固件（esp_https_ota 校验服务器证书） */
+                            esp_http_client_config_t cc = {
+                                .url = OTA_FW_URL,
+                                .username = DEVICE_ID,
+                                .password = DEVICE_KEY,
+                                .timeout_ms = 60000,
+                                .keep_alive_enable = true,
+                                .cert_pem = (const char *)mqtt_ca_pem_start,
+                            };
+                            esp_https_ota_config_t oc = { .http_config = &cc };
+                            if (esp_https_ota(&oc) == ESP_OK) {
+                                oled_show_lines("OTA OK\nRestarting...");
+                                vTaskDelay(pdMS_TO_TICKS(1000));
+                                esp_restart();
+                            } else {
+                                ESP_LOGE(TAG, "OTA 下载/校验失败");
+                                oled_show_lines("OTA Failed\nRetry later");
+                            }
+                        }
+                    }
+                    cJSON_Delete(j);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(OTA_CHECK_MS));
+    }
+}
+
 /* ---------------- MQTT ---------------- */
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data);
@@ -307,6 +489,8 @@ static void log_json_fields(const cJSON *obj)
 static void mqtt_start(void)
 {
     if (s_mqtt) return;
+    char will_topic[96];
+    snprintf(will_topic, sizeof(will_topic), "devices/%s/status", DEVICE_ID);
     esp_mqtt_client_config_t cfg = {
         .broker = {
             .address = {
@@ -324,6 +508,13 @@ static void mqtt_start(void)
         },
         .session = {
             .keepalive = MQTT_KEEPALIVE,
+            .last_will = {
+                .topic = will_topic,        /* 异常掉线时自动上报 offline */
+                .msg = "offline",
+                .msg_len = 7,
+                .qos = 1,
+                .retain = 1,
+            },
         },
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
@@ -335,55 +526,76 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
-    char buf[96];   /* 装得下 "MQTT Connected\nsub: " + 48字节的完整 topic */
+    char buf[96];
 
     switch ((esp_mqtt_event_id_t)event_id) {
-    case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT connected, subscribing to \"%s\"", MQTT_TOPIC);
-        esp_mqtt_client_subscribe(s_mqtt, MQTT_TOPIC, 0);
-        snprintf(buf, sizeof(buf), "MQTT Connected\nsub: %s", MQTT_TOPIC);
+    case MQTT_EVENT_CONNECTED: {
+        ESP_LOGI(TAG, "MQTT connected");
+        /* 上线标记（offline 由遗嘱消息自动上报） */
+        char st[96];
+        snprintf(st, sizeof(st), "devices/%s/status", DEVICE_ID);
+        esp_mqtt_client_publish(s_mqtt, st, "online", 0, 1, 1);
+        /* 订阅配置通道（retain：上线立即收到最新配置）与指令通道 */
+        char cfg_t[96], cmd_t[96];
+        snprintf(cfg_t, sizeof(cfg_t), "devices/%s/config", DEVICE_ID);
+        snprintf(cmd_t, sizeof(cmd_t), "devices/%s/cmd", DEVICE_ID);
+        esp_mqtt_client_subscribe(s_mqtt, cfg_t, 1);
+        esp_mqtt_client_subscribe(s_mqtt, cmd_t, 1);
+        snprintf(buf, sizeof(buf), "MQTT OK\ncfg: %s", cfg_t);
         oled_show_lines(buf);
         break;
+    }
 
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "MQTT disconnected, reconnecting...");
-        oled_show_lines("MQTT Disconnected\nReconnecting...");
+        oled_show_lines("MQTT Lost\nReconnecting...");
         break;
 
     case MQTT_EVENT_DATA: {
-        /* 只处理订阅主题的消息（指令通道） */
-        if (event->topic_len != (int)strlen(MQTT_TOPIC) ||
-            strncmp(event->topic, MQTT_TOPIC, event->topic_len) != 0) break;
-
         /* 收到的每条消息都完整打印，方便调试 */
         ESP_LOGI(TAG, "rx [%.*s] %.*s",
                  event->topic_len, event->topic,
                  event->data_len, event->data);
 
-        /* 指令 JSON：{"type":"display","text":"..."}，text 含 \n 可换行 */
         static char buf[512];
         size_t len = event->data_len;
         if (len >= sizeof(buf)) len = sizeof(buf) - 1;
         memcpy(buf, event->data, len);
         buf[len] = 0;
 
-        cJSON *root = cJSON_Parse(buf);
-        if (!root) { ESP_LOGW(TAG, "指令 JSON 解析失败: %s", buf); break; }
+        bool is_cmd = strstr(event->topic, "/cmd") != NULL;
+        bool is_cfg = strstr(event->topic, "/config") != NULL;
 
-        /* 解析成功则逐字段打印：变量名 = 数值 */
+        cJSON *root = cJSON_Parse(buf);
+        if (!root) { ESP_LOGW(TAG, "消息 JSON 解析失败: %s", buf); break; }
         log_json_fields(root);
 
-        const cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
-        const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
-        if (cJSON_IsString(type) && strcmp(type->valuestring, "display") == 0
-            && cJSON_IsString(text)) {
-            ESP_LOGI(TAG, "display: %s", text->valuestring);
-            oled_show_message(text->valuestring);
-            /* 回执：控制台页实时显示"设备已确认" */
-            char ack_topic[96], ack[64];
-            snprintf(ack_topic, sizeof(ack_topic), "devices/%s/cmd/ack", DEVICE_ID);
-            snprintf(ack, sizeof(ack), "{\"ack\":true,\"type\":\"display\"}");
-            esp_mqtt_client_publish(s_mqtt, ack_topic, ack, 0, 1, 0);
+        if (is_cfg) {
+            /* 配置协议：{"cfg_version":N,"config":{...}} */
+            const cJSON *ver = cJSON_GetObjectItemCaseSensitive(root, "cfg_version");
+            const cJSON *cfg = cJSON_GetObjectItemCaseSensitive(root, "config");
+            if (cJSON_IsObject(cfg)) {
+                if (cJSON_IsNumber(ver)) g_cfg_version = ver->valueint;
+                apply_config(cfg);
+                /* 回执（带版本号）：控制台据此显示"已同步 vN" */
+                char ack_topic[96], ack[96];
+                snprintf(ack_topic, sizeof(ack_topic), "devices/%s/config/ack", DEVICE_ID);
+                snprintf(ack, sizeof(ack), "{\"ack\":true,\"cfg_version\":%d}", g_cfg_version);
+                esp_mqtt_client_publish(s_mqtt, ack_topic, ack, 0, 1, 0);
+            }
+        } else if (is_cmd) {
+            /* 指令：{"type":"display","text":"..."}，text 含 \n 可换行 */
+            const cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+            const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
+            if (cJSON_IsString(type) && strcmp(type->valuestring, "display") == 0
+                && cJSON_IsString(text)) {
+                ESP_LOGI(TAG, "display: %s", text->valuestring);
+                oled_show_message(text->valuestring);
+                char ack_topic[96], ack[64];
+                snprintf(ack_topic, sizeof(ack_topic), "devices/%s/cmd/ack", DEVICE_ID);
+                snprintf(ack, sizeof(ack), "{\"ack\":true,\"type\":\"display\"}");
+                esp_mqtt_client_publish(s_mqtt, ack_topic, ack, 0, 1, 0);
+            }
         }
         cJSON_Delete(root);
         break;
@@ -508,7 +720,12 @@ void app_main(void)
     oled_cmd(0xAF); // display on
 
     s_disp_mutex = xSemaphoreCreateMutex();
-    oled_show_lines("OBC OLED\nIoT Display");   /* 开机画面 */
+
+    /* 从 NVS 恢复上次配置（重启/断电不丢）并应用亮度 */
+    config_load();
+    oled_cmd(0x81);
+    oled_cmd(g_brightness);
+    oled_show_lines(g_default_text);            /* 开机画面 = 默认显示文本 */
 
     /* ---- WiFi STA ---- */
     ESP_ERROR_CHECK(esp_netif_init());
@@ -531,10 +748,13 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     xTaskCreate(wifi_retry_task, "wifi_retry", 4096, NULL, 4, NULL);
+    xTaskCreate(telemetry_task, "telemetry", 4096, NULL, 5, NULL);
+    xTaskCreate(ota_task, "ota", 6144, NULL, 3, NULL);
 
     char boot[96];
     snprintf(boot, sizeof(boot), "WiFi Connecting\n%s", WIFI_SSID);
     oled_show_lines(boot);
 
-    ESP_LOGI(TAG, "Ready. SSID=%s topic=%s", WIFI_SSID, MQTT_TOPIC);
+    ESP_LOGI(TAG, "Ready. SSID=%s fw=%s cfg_v=%d",
+             WIFI_SSID, APP_VERSION, g_cfg_version);
 }
