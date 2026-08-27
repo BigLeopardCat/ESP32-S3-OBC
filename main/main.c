@@ -500,9 +500,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 && cJSON_IsString(text)) {
                 ESP_LOGI(TAG, "display: %s", text->valuestring);
                 oled_show_message(text->valuestring);
-                char ack_topic[96], ack[64];
+                /* 回执：原样带回下发链路的 req_id（device-service 端到端对账用），
+                   无 req_id（旧版服务/手动下发）时回基础回执 */
+                char ack_topic[96], ack[192];
+                const cJSON *req = cJSON_GetObjectItemCaseSensitive(root, "req_id");
                 snprintf(ack_topic, sizeof(ack_topic), "devices/%s/cmd/ack", DEVICE_ID);
-                snprintf(ack, sizeof(ack), "{\"ack\":true,\"type\":\"display\"}");
+                if (cJSON_IsString(req)) {
+                    snprintf(ack, sizeof(ack),
+                             "{\"ack\":true,\"type\":\"display\",\"req_id\":\"%.120s\"}",
+                             req->valuestring);
+                } else {
+                    snprintf(ack, sizeof(ack), "{\"ack\":true,\"type\":\"display\"}");
+                }
                 esp_mqtt_client_publish(s_mqtt, ack_topic, ack, 0, 1, 0);
             }
         }
