@@ -27,6 +27,8 @@
 #include "driver/gpio.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
+#include "u8g2.h"
+#include "esp_rom_sys.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "esp_timer.h"
@@ -73,15 +75,12 @@ extern const uint8_t mqtt_ca_pem_start[] asm("_binary_saudade_site_ca_pem_start"
 #define OLED_H_RES     128
 #define OLED_V_RES     64
 
-/* 5x7 ASCII 字体：每字符 5 字节（每字节一列），bit0 为最上行 */
-#define FONT_W          5
-#define FONT_H          7
-#define CHAR_ADV        (FONT_W + 1)               /* 字符步进（含 1px 间距） */
-#define CHARS_PER_LINE  (OLED_H_RES / CHAR_ADV)    /* 每行字符数 = 21 */
-#define MAX_LINES       (OLED_V_RES / (FONT_H + 1))/* 最多行数 = 8 */
+/* u8g2 显示（文泉驿12px 全量 GB2312 字库，6763 汉字）：CJK 字宽 12px，ASCII 半宽 6px */
+#define FONT_LINE_H     13                  /* 行高：12px 字高 + 1px 间距 */
+#define MAX_TEXT_LINES  4                   /* 最多显示行数 */
+#define LINE_MAX_W      (OLED_H_RES - 2)    /* 单行最大像素宽度 */
 
 static spi_device_handle_t s_spi;
-static uint8_t s_fb[OLED_H_RES * OLED_V_RES / 8];  /* 128x64 帧缓冲（内部 RAM，DMA 可用） */
 static SemaphoreHandle_t s_disp_mutex;
 static volatile bool s_wifi_connected = false;
 static esp_mqtt_client_handle_t s_mqtt = NULL;
@@ -107,200 +106,118 @@ static void oled_data(const uint8_t *data, int len)
     spi_device_polling_transmit(s_spi, &t);
 }
 
-static void fb_clear(void)
-{
-    memset(s_fb, 0, sizeof(s_fb));
-}
+static u8g2_t s_u8g2;
 
-static void fb_pixel(int x, int y)
+/* u8g2 字节回调：命令/数据转发到自有 SPI 驱动 */
+static uint8_t u8x8_byte_obc(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
 {
-    if (x < 0 || x >= OLED_H_RES || y < 0 || y >= OLED_V_RES) return;
-    s_fb[(y >> 3) * OLED_H_RES + x] |= (1 << (y & 7));
-}
-
-/* 整帧刷屏（page 寻址，8 页 × 128 字节） */
-static void oled_flush(void)
-{
-    for (int p = 0; p < 8; p++) {
-        oled_cmd(0xB0 | p);   /* 设置页地址 */
-        oled_cmd(0x00);       /* 列地址低 4 位 */
-        oled_cmd(0x10);       /* 列地址高 4 位 */
-        oled_data(&s_fb[p * OLED_H_RES], OLED_H_RES);
-    }
-}
-
-/* ---------------- 5x7 ASCII 字体（经典 glcdfont） ---------------- */
-static const uint8_t font5x7[95][FONT_W] = {
-    {0x00,0x00,0x00,0x00,0x00}, /*   */
-    {0x00,0x00,0x5F,0x00,0x00}, /* ! */
-    {0x00,0x07,0x00,0x07,0x00}, /* " */
-    {0x14,0x7F,0x14,0x7F,0x14}, /* # */
-    {0x24,0x2A,0x7F,0x2A,0x12}, /* $ */
-    {0x23,0x13,0x08,0x64,0x62}, /* % */
-    {0x36,0x49,0x55,0x22,0x50}, /* & */
-    {0x00,0x05,0x03,0x00,0x00}, /* ' */
-    {0x00,0x1C,0x22,0x41,0x00}, /* ( */
-    {0x00,0x41,0x22,0x1C,0x00}, /* ) */
-    {0x08,0x2A,0x1C,0x2A,0x08}, /* * */
-    {0x08,0x08,0x3E,0x08,0x08}, /* + */
-    {0x00,0x50,0x30,0x00,0x00}, /* , */
-    {0x08,0x08,0x08,0x08,0x08}, /* - */
-    {0x00,0x60,0x60,0x00,0x00}, /* . */
-    {0x20,0x10,0x08,0x04,0x02}, /* / */
-    {0x3E,0x51,0x49,0x45,0x3E}, /* 0 */
-    {0x00,0x42,0x7F,0x40,0x00}, /* 1 */
-    {0x42,0x61,0x51,0x49,0x46}, /* 2 */
-    {0x21,0x41,0x45,0x4B,0x31}, /* 3 */
-    {0x18,0x14,0x12,0x7F,0x10}, /* 4 */
-    {0x27,0x45,0x45,0x45,0x39}, /* 5 */
-    {0x3C,0x4A,0x49,0x49,0x30}, /* 6 */
-    {0x01,0x71,0x09,0x05,0x03}, /* 7 */
-    {0x36,0x49,0x49,0x49,0x36}, /* 8 */
-    {0x06,0x49,0x49,0x29,0x1E}, /* 9 */
-    {0x00,0x36,0x36,0x00,0x00}, /* : */
-    {0x00,0x56,0x36,0x00,0x00}, /* ; */
-    {0x00,0x08,0x14,0x22,0x41}, /* < */
-    {0x14,0x14,0x14,0x14,0x14}, /* = */
-    {0x41,0x22,0x14,0x08,0x00}, /* > */
-    {0x02,0x01,0x51,0x09,0x06}, /* ? */
-    {0x32,0x49,0x79,0x41,0x3E}, /* @ */
-    {0x7E,0x11,0x11,0x11,0x7E}, /* A */
-    {0x7F,0x49,0x49,0x49,0x36}, /* B */
-    {0x3E,0x41,0x41,0x41,0x22}, /* C */
-    {0x7F,0x41,0x41,0x22,0x1C}, /* D */
-    {0x7F,0x49,0x49,0x49,0x41}, /* E */
-    {0x7F,0x09,0x09,0x01,0x01}, /* F */
-    {0x3E,0x41,0x41,0x51,0x32}, /* G */
-    {0x7F,0x08,0x08,0x08,0x7F}, /* H */
-    {0x00,0x41,0x7F,0x41,0x00}, /* I */
-    {0x20,0x40,0x41,0x3F,0x01}, /* J */
-    {0x7F,0x08,0x14,0x22,0x41}, /* K */
-    {0x7F,0x40,0x40,0x40,0x40}, /* L */
-    {0x7F,0x02,0x04,0x02,0x7F}, /* M */
-    {0x7F,0x04,0x08,0x10,0x7F}, /* N */
-    {0x3E,0x41,0x41,0x41,0x3E}, /* O */
-    {0x7F,0x09,0x09,0x09,0x06}, /* P */
-    {0x3E,0x41,0x51,0x21,0x5E}, /* Q */
-    {0x7F,0x09,0x19,0x29,0x46}, /* R */
-    {0x46,0x49,0x49,0x49,0x31}, /* S */
-    {0x01,0x01,0x7F,0x01,0x01}, /* T */
-    {0x3F,0x40,0x40,0x40,0x3F}, /* U */
-    {0x1F,0x20,0x40,0x20,0x1F}, /* V */
-    {0x7F,0x20,0x18,0x20,0x7F}, /* W */
-    {0x63,0x14,0x08,0x14,0x63}, /* X */
-    {0x03,0x04,0x78,0x04,0x03}, /* Y */
-    {0x61,0x51,0x49,0x45,0x43}, /* Z */
-    {0x00,0x00,0x7F,0x41,0x41}, /* [ */
-    {0x02,0x04,0x08,0x10,0x20}, /* \ */
-    {0x41,0x41,0x7F,0x00,0x00}, /* ] */
-    {0x04,0x02,0x01,0x02,0x04}, /* ^ */
-    {0x40,0x40,0x40,0x40,0x40}, /* _ */
-    {0x00,0x01,0x02,0x04,0x00}, /* ` */
-    {0x20,0x54,0x54,0x54,0x78}, /* a */
-    {0x7F,0x48,0x44,0x44,0x38}, /* b */
-    {0x38,0x44,0x44,0x44,0x20}, /* c */
-    {0x38,0x44,0x44,0x48,0x7F}, /* d */
-    {0x38,0x54,0x54,0x54,0x18}, /* e */
-    {0x08,0x7E,0x09,0x01,0x02}, /* f */
-    {0x0C,0x52,0x52,0x52,0x3E}, /* g */
-    {0x7F,0x08,0x04,0x04,0x78}, /* h */
-    {0x00,0x44,0x7D,0x40,0x00}, /* i */
-    {0x20,0x40,0x44,0x3D,0x00}, /* j */
-    {0x7F,0x10,0x28,0x44,0x00}, /* k */
-    {0x00,0x41,0x7F,0x40,0x00}, /* l */
-    {0x7C,0x04,0x18,0x04,0x78}, /* m */
-    {0x7C,0x08,0x04,0x04,0x78}, /* n */
-    {0x38,0x44,0x44,0x44,0x38}, /* o */
-    {0x7C,0x14,0x14,0x14,0x08}, /* p */
-    {0x08,0x14,0x14,0x18,0x7C}, /* q */
-    {0x7C,0x08,0x04,0x04,0x08}, /* r */
-    {0x48,0x54,0x54,0x54,0x20}, /* s */
-    {0x04,0x3F,0x44,0x40,0x20}, /* t */
-    {0x3C,0x40,0x40,0x20,0x7C}, /* u */
-    {0x1C,0x20,0x40,0x20,0x1C}, /* v */
-    {0x3C,0x40,0x30,0x40,0x3C}, /* w */
-    {0x44,0x28,0x10,0x28,0x44}, /* x */
-    {0x0C,0x50,0x50,0x50,0x3C}, /* y */
-    {0x44,0x64,0x54,0x4C,0x44}, /* z */
-    {0x00,0x08,0x36,0x41,0x00}, /* { */
-    {0x00,0x00,0x7F,0x00,0x00}, /* | */
-    {0x00,0x41,0x36,0x08,0x00}, /* } */
-    {0x08,0x04,0x08,0x10,0x08}, /* ~ */
-};
-
-/* ---------------- 文字绘制 ---------------- */
-/* 画一个字符，返回下一个字符的 x 坐标；非 ASCII 显示为 ? */
-static int draw_char(int x, int y, char c)
-{
-    if (c < 0x20 || c > 0x7E) c = '?';
-    const uint8_t *g = font5x7[c - 0x20];
-    for (int col = 0; col < FONT_W; col++) {
-        for (int row = 0; row < FONT_H; row++) {
-            if (g[col] & (1 << row)) fb_pixel(x + col, y + row);
+    static uint8_t dc = 0;
+    switch (msg) {
+    case U8X8_MSG_BYTE_SET_DC:
+        dc = arg_int;
+        break;
+    case U8X8_MSG_BYTE_SEND:   /* 注：== U8X8_MSG_CAD_SEND_DATA（u8x8.h 中的别名） */
+        if (dc) {
+            oled_data(arg_ptr, arg_int);
+        } else {
+            for (int i = 0; i < arg_int; i++) {
+                oled_cmd(((const uint8_t *)arg_ptr)[i]);
+            }
         }
+        break;
+    default:
+        break;
     }
-    return x + CHAR_ADV;
+    return 1;
 }
 
-/* 画一行文本（水平居中） */
-static void draw_line_centered(const char *text, int y)
+/* u8g2 GPIO/延时回调：只处理复位和延时（CS/DC/SCLK/MOSI 由 SPI 驱动和字节回调处理） */
+static uint8_t u8x8_gpio_obc(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
 {
-    int w = strlen(text) * CHAR_ADV;
+    switch (msg) {
+    case U8X8_MSG_GPIO_RESET:
+        gpio_set_level((gpio_num_t)OLED_PIN_RST, arg_int);
+        break;
+    case U8X8_MSG_DELAY_100NANO:
+        esp_rom_delay_us(1);
+        break;
+    case U8X8_MSG_DELAY_MILLI:
+        vTaskDelay(pdMS_TO_TICKS(arg_int));
+        break;
+    default:
+        break;
+    }
+    return 1;
+}
+
+/* ---------------- 文字绘制（u8g2 + 文泉驿12px 中文字体） ---------------- */
+
+/* UTF-8 字符像素宽度：ASCII 6px，多字节（CJK）12px */
+static int utf8_char_width(const char *c)
+{
+    return ((uint8_t)*c < 0x80) ? 6 : 12;
+}
+
+/* 居中画一行 UTF-8 文本 */
+static void draw_utf8_centered(const char *text, int y, int ascent)
+{
+    int w = 0;
+    for (const char *p = text; *p; ) {
+        int len = ((uint8_t)*p < 0x80) ? 1 : (((uint8_t)*p < 0xE0) ? 2 : (((uint8_t)*p < 0xF0) ? 3 : 4));
+        w += utf8_char_width(p);
+        p += len;
+    }
     if (w > OLED_H_RES) w = OLED_H_RES;
     int x = (OLED_H_RES - w) / 2;
     if (x < 0) x = 0;
-    for (; *text; text++) x = draw_char(x, y, *text);
+    u8g2_DrawUTF8(&s_u8g2, x, y, text);
 }
 
-/* 状态显示：多行文本（\n 分隔），每行居中，最多 8 行 */
-static void oled_show_lines(const char *lines)
+/* 通用文本显示：UTF-8 消息自动换行（不切汉字），每行居中 */
+static void oled_show_text(const char *utf8_text)
 {
     if (s_disp_mutex) xSemaphoreTake(s_disp_mutex, portMAX_DELAY);
-    fb_clear();
-    int y = 0;
-    const char *p = lines;
-    while (*p && y < OLED_V_RES) {
-        const char *e = p;
-        while (*e && *e != '\n') e++;
-        int n = (e - p < CHARS_PER_LINE) ? (int)(e - p) : CHARS_PER_LINE;
-        char tmp[CHARS_PER_LINE + 1];
-        memcpy(tmp, p, n);
-        tmp[n] = 0;
-        draw_line_centered(tmp, y);
-        y += FONT_H + 1;
-        p = (*e == '\n') ? e + 1 : e;
-    }
-    oled_flush();
-    if (s_disp_mutex) xSemaphoreGive(s_disp_mutex);
-}
+    u8g2_ClearBuffer(&s_u8g2);
+    /* 全量 GB2312（6763 汉字 + ASCII），按 Unicode 索引，DrawUTF8 直接可用 */
+    u8g2_SetFont(&s_u8g2, u8g2_font_wqy12_t_gb2312);
 
-/* 消息显示：自动换行（尽量不切断单词），每行居中 */
-static void oled_show_message(const char *msg)
-{
-    if (s_disp_mutex) xSemaphoreTake(s_disp_mutex, portMAX_DELAY);
-    fb_clear();
-    int y = 0;
-    const char *p = msg;
-    while (*p && y < OLED_V_RES) {
-        int n = 0;
-        while (p[n] && p[n] != '\n' && n < CHARS_PER_LINE) n++;
-        bool forced = (n == CHARS_PER_LINE) && p[n] && p[n] != '\n';
-        if (forced) {   /* 行尾回退到最后一个空格，避免切断单词 */
-            int sp = n;
-            while (sp > 0 && p[sp - 1] != ' ') sp--;
-            if (sp > 0) n = sp;
+    int ascent = u8g2_GetFontAscent(&s_u8g2);
+    if (ascent <= 0 || ascent > FONT_LINE_H) ascent = FONT_LINE_H - 1;
+    int y = (OLED_V_RES - FONT_LINE_H * MAX_TEXT_LINES) / 2 + ascent;  /* 垂直居中 */
+
+    const char *p = utf8_text;
+    int line = 0;
+    while (*p && line < MAX_TEXT_LINES) {
+        /* 截取一行：宽度 ≤ LINE_MAX_W，遇 \n 换行 */
+        const char *end = p;
+        int w = 0;
+        while (*end && *end != '\n' && w < LINE_MAX_W) {
+            int len = ((uint8_t)*end < 0x80) ? 1 : (((uint8_t)*end < 0xE0) ? 2 : (((uint8_t)*end < 0xF0) ? 3 : 4));
+            w += utf8_char_width(end);
+            end += len;
         }
-        char tmp[CHARS_PER_LINE + 1];
-        memcpy(tmp, p, n);
-        tmp[n] = 0;
-        draw_line_centered(tmp, y);
-        y += FONT_H + 1;
-        p += n;
-        if (*p == ' ' || *p == '\n') p++;
+        /* 若因宽度截断落在多字节字符中间，回退到字符边界 */
+        if (*end && *end != '\n' && ((uint8_t)*end & 0xC0) == 0x80) {
+            while (end > p && ((uint8_t)*end & 0xC0) == 0x80) end--;
+        }
+        char buf[32];
+        int n = (int)(end - p);
+        if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+        memcpy(buf, p, n);
+        buf[n] = 0;
+        draw_utf8_centered(buf, y, ascent);
+        y += FONT_LINE_H;
+        p = end;
+        if (*p == '\n') p++;
+        line++;
     }
-    oled_flush();
+    u8g2_SendBuffer(&s_u8g2);
     if (s_disp_mutex) xSemaphoreGive(s_disp_mutex);
 }
+
+/* 兼容旧接口：状态/消息都走统一渲染 */
+static void oled_show_lines(const char *lines) { oled_show_text(lines); }
+static void oled_show_message(const char *msg)  { oled_show_text(msg); }
 
 /* ---------------- 配置持久化（NVS） ---------------- */
 static void config_save(void)
@@ -344,8 +261,10 @@ static void apply_config(const cJSON *cfg)
         }
     }
     /* 应用亮度（SSD1306 对比度指令） */
+    if (s_disp_mutex) xSemaphoreTake(s_disp_mutex, portMAX_DELAY);
     oled_cmd(0x81);
     oled_cmd(g_brightness);
+    if (s_disp_mutex) xSemaphoreGive(s_disp_mutex);
     if (changed) config_save();
     ESP_LOGI(TAG, "配置应用: brightness=%d default_text=%s",
              g_brightness, g_default_text);
@@ -367,7 +286,7 @@ static void publish_telemetry(void)
     snprintf(payload, sizeof(payload),
              "{\"cfg_version\":%d,\"firmware\":\"%s\",\"temperature\":%.1f,"
              "\"rssi\":%d,\"uptime\":%u,\"brightness\":%d}",
-             g_cfg_version, APP_VERSION, temp, rssi,
+             (int)g_cfg_version, APP_VERSION, temp, rssi,
              (unsigned)(esp_timer_get_time() / 1000000), g_brightness);
     esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
 }
@@ -516,7 +435,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
-    char buf[96];
+    char buf[128];
 
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED: {
@@ -570,7 +489,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 /* 回执（带版本号）：控制台据此显示"已同步 vN" */
                 char ack_topic[96], ack[96];
                 snprintf(ack_topic, sizeof(ack_topic), "devices/%s/config/ack", DEVICE_ID);
-                snprintf(ack, sizeof(ack), "{\"ack\":true,\"cfg_version\":%d}", g_cfg_version);
+                snprintf(ack, sizeof(ack), "{\"ack\":true,\"cfg_version\":%d}", (int)g_cfg_version);
                 esp_mqtt_client_publish(s_mqtt, ack_topic, ack, 0, 1, 0);
             }
         } else if (is_cmd) {
@@ -675,41 +594,15 @@ void app_main(void)
 
     gpio_set_direction((gpio_num_t)OLED_PIN_DC, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)OLED_PIN_RST, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)OLED_PIN_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level((gpio_num_t)OLED_PIN_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    oled_cmd(0xAE); // display off
-    oled_cmd(0x20); // Set Memory Addressing Mode
-    oled_cmd(0x02); // 02=Page Addressing Mode
-    oled_cmd(0xB0); // Set Page Start Address
-    oled_cmd(0xC8); // Set COM Output Scan Direction
-    oled_cmd(0x00); // set low column address
-    oled_cmd(0x10); // set high column address
-    oled_cmd(0x40); // set start line address
-    oled_cmd(0x81); // set contrast control register
-    oled_cmd(0xFF);
-    oled_cmd(0xA1); // set segment re-map 0 to 127
-    oled_cmd(0xA6); // set normal display（若显示为反色，改成 0xA7）
-    oled_cmd(0xA8); // set multiplex ratio(1 to 64)
-    oled_cmd(0x3F);
-    oled_cmd(0xA4); // output follows RAM content
-    oled_cmd(0xD3); // set display offset
-    oled_cmd(0x00); // no offset
-    oled_cmd(0xD5); // set display clock divide ratio/oscillator frequency
-    oled_cmd(0xF0);
-    oled_cmd(0xD9); // set pre-charge period
-    oled_cmd(0x22);
-    oled_cmd(0xDA); // set com pins hardware configuration
-    oled_cmd(0x12);
-    oled_cmd(0xDB); // set vcomh
-    oled_cmd(0x20);
-    oled_cmd(0x8D); // set DC-DC enable
-    oled_cmd(0x14);
-    oled_cmd(0xAF); // display on
 
     s_disp_mutex = xSemaphoreCreateMutex();
+
+    /* u8g2 初始化（内部完成 SSD1306 复位+配置，走上面两个回调）
+     * 注意：必须用 _f（全帧 1024 字节缓冲），_1 只有 128 字节（8 行），
+     *       其余区域会显示上电随机内容（乱码） */
+    u8g2_Setup_ssd1306_128x64_noname_f(&s_u8g2, U8G2_R0, u8x8_byte_obc, u8x8_gpio_obc);
+    u8g2_InitDisplay(&s_u8g2);
+    u8g2_SetPowerSave(&s_u8g2, 0);
 
     /* 从 NVS 恢复上次配置（重启/断电不丢）并应用亮度 */
     config_load();
