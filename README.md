@@ -2,15 +2,19 @@
 
 128x64 SPI OLED 车载显示终端，接入 saudade.site IoT 平台（EMQX + 设备服务）。
 
+> 📖 **接入协议详解、拓展指南、控制台搭配**：[docs/device-integration.md](docs/device-integration.md)
+> （MQTT topic 全表、payload 字段、req_id 回执对账、OTA 流程、如何新增指令/配置项/接真实传感器）
+
 ## 功能
 
 - **MQTT over TLS**（mqtts://saudade.site:8883，device_id + device_key 认证，证书链校验）
 - **指令显示**：控制台/网页发送 `{"type":"display","text":"..."}` → OLED 实时显示（含 \n 换行、自动折行、居中）
+- **指令回执（req_id 对账）**：执行后回 `cmd/ack`，`req_id` 原样带回——控制台/agent 可端到端确认指令已执行（cmd_history 全链路可查）
 - **参数配置（版本化）**：控制台下发 `{"cfg_version":N,"config":{...}}` →
   应用 OLED 亮度/默认文本 → NVS 持久化（重启不丢）→ 回执 `config/ack`（带版本号）
 - **遥测上报**：每 5s 上报 生效配置版本 / 固件版本 / 温度 / RSSI / 运行时长
 - **在线状态**：连接即上报 online，异常掉线由遗嘱消息自动标记 offline
-- **OTA 远程升级**：每 6 小时轮询平台固件仓库，发现新版本自动下载升级（A/B 分区 + esp_https_ota）
+- **OTA 远程升级**：每 6 小时轮询平台固件仓库，发现新版本自动下载升级（A/B 分区 + esp_https_ota，current 指针支持版本切换/回滚）
 - **断线自愈**：WiFi/MQTT 自动重连；上线后 retain 配置自动补发
 
 ## 硬件
