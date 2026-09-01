@@ -53,7 +53,7 @@ extern const uint8_t mqtt_ca_pem_start[] asm("_binary_saudade_site_ca_pem_start"
 #define MQTT_KEEPALIVE  60
 
 /* 固件版本（OTA 比对用）：每次发版手动 +1，如 1.1.0 */
-#define APP_VERSION     "1.1.0"
+#define APP_VERSION     "1.2.0"
 
 /* OTA：平台固件仓库（需与设备服务版本一致），上传新固件到控制台后自动升级 */
 #define OTA_INFO_URL    "https://saudade.site/device-api/api/ota/info"
@@ -167,7 +167,8 @@ static void draw_utf8_centered(const char *text, int y, int ascent)
         w += utf8_char_width(p);
         p += len;
     }
-    if (w > OLED_H_RES) w = OLED_H_RES;
+    /* 20260831：clamp 口径与行截断一致用 LINE_MAX_W（128→126），超宽行不再按 128 居中导致左贴边 */
+    if (w > LINE_MAX_W) w = LINE_MAX_W;
     int x = (OLED_H_RES - w) / 2;
     if (x < 0) x = 0;
     u8g2_DrawUTF8(&s_u8g2, x, y, text);
@@ -188,17 +189,19 @@ static void oled_show_text(const char *utf8_text)
     const char *p = utf8_text;
     int line = 0;
     while (*p && line < MAX_TEXT_LINES) {
-        /* 截取一行：宽度 ≤ LINE_MAX_W，遇 \n 换行 */
+        /* 截取一行：宽度 ≤ LINE_MAX_W，遇 \n 换行。
+           20260831 修复"先加后查"：旧逻辑把超宽字符先加入本行再退出循环，整行
+           超宽（如 11 个全角 = 132px > 126）居中时 x 被 clamp 到 0，最右侧字符
+           被屏幕右缘裁切（"中午吃碗热汤面，加个蛋"的"蛋"右 4px 被切掉）；
+           现改为"先查后加"，超宽字符留给下一行。旧的回退逻辑（字节中间截断）
+           是死代码——end 始终按完整字符长度前进，不会落在字节中间，已删除。 */
         const char *end = p;
         int w = 0;
-        while (*end && *end != '\n' && w < LINE_MAX_W) {
+        while (*end && *end != '\n') {
             int len = ((uint8_t)*end < 0x80) ? 1 : (((uint8_t)*end < 0xE0) ? 2 : (((uint8_t)*end < 0xF0) ? 3 : 4));
+            if (w + utf8_char_width(end) > LINE_MAX_W) break;
             w += utf8_char_width(end);
             end += len;
-        }
-        /* 若因宽度截断落在多字节字符中间，回退到字符边界 */
-        if (*end && *end != '\n' && ((uint8_t)*end & 0xC0) == 0x80) {
-            while (end > p && ((uint8_t)*end & 0xC0) == 0x80) end--;
         }
         char buf[32];
         int n = (int)(end - p);
