@@ -9,6 +9,8 @@
 
 - **MQTT over TLS**（mqtts://saudade.site:8883，device_id + device_key 认证，证书链校验）
 - **指令显示**：控制台/网页发送 `{"type":"display","text":"..."}` → OLED 实时显示（含 \n 换行、自动折行、居中）
+- **指令绘图**（1.3.0）：`{"type":"draw","ops":[["circle",64,26,18],["text",44,52,"加油"]]}` → 按矢量 op 列表绘制
+  （9 种图形 pixel/line/box/frame/rbox/disc/circle/tri + 中文 text；op 表见接入文档 §2.5）
 - **指令回执（req_id 对账）**：执行后回 `cmd/ack`，`req_id` 原样带回——控制台/agent 可端到端确认指令已执行（cmd_history 全链路可查）
 - **参数配置（版本化）**：控制台下发 `{"cfg_version":N,"config":{...}}` →
   应用 OLED 亮度/默认文本 → NVS 持久化（重启不丢）→ 回执 `config/ack`（带版本号）
@@ -59,7 +61,7 @@ idf.py -p /dev/ttyUSB0 flash monitor
 
 ## OTA 升级
 
-1. 控制台/接口上传新固件：`PUT /api/ota/firmware?version=1.2.0`（body=固件 bin）
+1. 控制台/接口上传新固件：`PUT /api/ota/firmware?version=1.3.0`（body=固件 bin）
 2. 设备每 6 小时轮询 `GET /api/ota/info`，版本高于本地 → 自动下载升级并重启
 3. 升级后遥测上报新固件版本，控制台可见
 

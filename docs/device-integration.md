@@ -98,25 +98,76 @@ device-service (:3100) ── 控制台下发指令/配置/OTA
 
 ### 2.5 指令（下行 + req_id 回执）
 
-平台下发：
+设备处理入口：`mqtt_event_handler` 的 `is_cmd` 分支（`strstr(topic, "/cmd")` 区分指令/配置）。
+按 `type` 分派，目前两种：`display`（印文字）与 `draw`（画图形，1.3.0 起）。
+
+**公共约定**（两种指令都适用）
+
+- 回执统一走 `devices/<id>/cmd/ack`，**`req_id` 原样带回**（设备不生成，只回显）；
+  旧版/手动下发无 `req_id` 时回执不带该字段（兼容）。
+- `type` 认不出 ⇒ **不回执**（设备没执行，回一条"成功"才是更坏的结果）。
+- **负载上限 4096 字节**（`RX_BUF_SIZE`，同时配给 `esp_mqtt_client_config_t.buffer.size`）。
+  超过 4096 的报文会被 esp-mqtt 分片投递，本固件**不做分片重组** ⇒ 明确报错并丢弃、不回执
+  （日志 `负载被分片…` / `负载 N 字节超缓冲…`）。1.2.0 及更早是 **512 字节静默截断**——
+  截一半交给 cJSON 解析失败，调用方只能看到"设备没回执"，症状像设备离线。
+
+`req_id` 端到端链路对账（commit 600fbf0 起）：控制台/agent 下发带 `req_id` → 设备回执带回 →
+device-service 写入 `cmd_history`——任何一环丢失都能定位（设备没收到 / 设备没回执 / 回执丢失）。
+
+#### 2.5.1 `display` —— 印一段文字
 
 ```json
 {"type": "display", "text": "Hello\n喵", "req_id": "a1b2c3"}
 ```
 
-设备处理（`is_cmd` 分支——`strstr(topic, "/cmd")` 区分指令/配置）：
-
-1. 解析 `type`：目前仅 `display`（OLED 显示）
-2. `text` 支持 `\n` 换行、UTF-8 自动折行（不切汉字）、居中显示，最多 4 行（`MAX_TEXT_LINES`）
-3. 回执 `devices/<id>/cmd/ack`——**`req_id` 原样带回**（设备不生成，只回显）：
+`text` 支持 `\n` 换行、UTF-8 自动折行（不切汉字）、**每行居中**，最多 4 行（`MAX_TEXT_LINES`）。
+回执：
 
 ```json
 {"ack": true, "type": "display", "req_id": "a1b2c3"}
 ```
 
-`req_id` 端到端链路对账（commit 600fbf0 起）：控制台/agent 下发带 `req_id` → 设备回执带回 →
-device-service 写入 `cmd_history`——任何一环丢失都能定位（设备没收到 / 设备没回执 / 回执丢失）。
-旧版/手动下发无 `req_id` 时回执不带该字段（兼容）。
+#### 2.5.2 `draw` —— 画一组矢量图形（1.3.0 起）
+
+```json
+{"type":"draw","ops":[["line",0,32,127,32],["disc",64,26,18],["text",4,50,"加油"]],"req_id":"a1b2c3"}
+```
+
+**`ops` 是数组的数组**：首元素是 op 名字，其余是参数。设备端就是一个遍历 + 按名字分派，
+**没有第二个 DSL 解析器**（可读的绘图 DSL 住在 agent 侧 `agent/oled_draw.py`，由它翻译成这个结构）。
+字段名故意叫 `ops` 而不是别的，是为了和 Python 侧的命名同源。
+
+op 表（**这张表就是跨仓契约**；固件侧唯一实现 = `main.c` 的 `DRAW_OPS`）：
+
+| op | 参数 | u8g2 调用 | 说明 |
+|---|---|---|---|
+| `pixel` | `x,y` | `u8g2_DrawPixel` | 单点 |
+| `line` | `x1,y1,x2,y2` | `u8g2_DrawLine` | 直线 |
+| `box` | `x,y,w,h` | `u8g2_DrawBox` | 实心矩形 |
+| `frame` | `x,y,w,h` | `u8g2_DrawFrame` | 空心矩形 |
+| `rbox` | `x,y,w,h,r` | `u8g2_DrawRBox` | 圆角实心（气泡框） |
+| `disc` | `x,y,r` | `u8g2_DrawDisc(…, U8G2_DRAW_ALL)` | 实心圆 |
+| `circle` | `x,y,r` | `u8g2_DrawCircle(…, U8G2_DRAW_ALL)` | 空心圆 |
+| `tri` | `x1,y1,x2,y2,x3,y3` | `u8g2_DrawTriangle` | 实心三角 |
+| `text` | `x,y,s` | `u8g2_DrawUTF8(x, y+ascent, s)` | **左上角**为 `(x,y)`；字体固定 wqy12（中文可用） |
+
+行为约定：
+
+1. **无 `clear` op**：每条 `draw` 一律**先清屏**再按序绘制（与 `display` 覆盖整屏一致）。
+2. 坐标域 0..127 / 0..63；**贴边钳制在服务端做**，设备只负责画（画布外的部分 u8g2 自己裁）。
+3. `text` 的 `s` 是**该 op 的最后一个元素、可含逗号与中文标点**（所以参数个数是"3"——x/y/s）。
+4. 名字未知 / 参数个数不符 / 类型不符（数字位给了字符串之类）⇒ **跳过该 op 并计数**，
+   不中断整幅画（缺一个图形比整屏空白更接近意图）。
+5. 单条指令最多 `DRAW_MAX_OPS=64` 个 op，超出的**如实计入回执的 `skipped`**，不静默丢。
+
+回执（`ops` = 实际绘制数，`skipped` = 被跳过的数——两者都进 `cmd_history`，便于事后对账）：
+
+```json
+{"ack": true, "type": "draw", "ops": 3, "skipped": 0, "req_id": "a1b2c3"}
+```
+
+> 设备**没有屏幕回读通道**（无法截图/读回显存）⇒ 调用方只能确认"指令合法且已执行"，
+> 画出来长什么样只有人眼判。`skipped > 0` 是唯一能自动发现的"画得不完整"信号。
 
 ### 2.6 在线状态机
 
@@ -133,7 +184,7 @@ device-service 写入 `cmd_history`——任何一环丢失都能定位（设备
 
 1. **轮询**：`ota_task` 启动 15s 后首查，之后每 6h（`OTA_CHECK_MS`）——
    `GET https://saudade.site/device-api/api/ota/info`，HTTP Basic 认证（device_id/device_key）
-2. **比对**：响应 `{"version":"1.2.0"}` 与本地 `APP_VERSION` 不一致即刷（支持升/降级）
+2. **比对**：响应 `{"version":"1.3.0"}` 与本地 `APP_VERSION` 不一致即刷（支持升/降级）
 3. **拉取**：`GET .../api/ota/fw/current.bin`（`current` 是平台侧指针，可切换版本，支持回滚）
 4. **烧写**：`esp_https_ota` 下载写入 A/B 分区（partitions.csv：4M factory + 4M ota_0 + 4M ota_1），
    重启后新固件生效，遥测上报新 `firmware` 版本

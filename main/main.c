@@ -5,6 +5,8 @@
  *   - 连接 WiFi (STA 模式)
  *   - 通过 MQTT over TLS (mqtts://) 连接 IoT 平台
  *   - 订阅指定 topic，收到消息后在 128x64 SPI OLED 上显示
+ *   - 指令 `display`：印一段文字（自动换行、每行居中）
+ *   - 指令 `draw`：画一组矢量图形（op 表见 oled_draw_ops；协议见 docs/device-integration.md §2.5）
  *
  * 硬件接线（与旧固件一致）：
  *   CS=36  DC=37  RST=38  MOSI=39  CLK=40
@@ -53,7 +55,7 @@ extern const uint8_t mqtt_ca_pem_start[] asm("_binary_saudade_site_ca_pem_start"
 #define MQTT_KEEPALIVE  60
 
 /* 固件版本（OTA 比对用）：每次发版手动 +1，如 1.1.0 */
-#define APP_VERSION     "1.2.0"
+#define APP_VERSION     "1.3.0"
 
 /* OTA：平台固件仓库（需与设备服务版本一致），上传新固件到控制台后自动升级 */
 #define OTA_INFO_URL    "https://saudade.site/device-api/api/ota/info"
@@ -62,6 +64,17 @@ extern const uint8_t mqtt_ca_pem_start[] asm("_binary_saudade_site_ca_pem_start"
 
 /* 遥测上报周期 */
 #define TELEMETRY_MS    5000
+
+/* 下行负载缓冲（1.3.0 起 512 → 4096）：
+ * 旧值 512 对 `display` 够用，但 `draw` 的 ops 数组 20~40 个图形就有几百字节、多的上千，
+ * 而超限在旧版是**静默截断**（截一半交给 cJSON_Parse ⇒ 只留一句"解析失败" ⇒ 不回执 ⇒
+ * 调用方只能看到"设备没确认"，症状像设备离线）。这里同时喂给两处：
+ *   - MQTT_EVENT_DATA 里的 static buf
+ *   - esp_mqtt_client_config_t.buffer.size（esp-mqtt 的接收缓冲，默认 1024）
+ * 两者必须同源，否则又会出现"缓冲比这里小、照样被分片"。 */
+#define RX_BUF_SIZE     4096
+/* 单条 draw 指令最多绘制的图形数（超出的如实计入回执的 skipped，不静默丢） */
+#define DRAW_MAX_OPS    64
 /* ============================================================= */
 
 #define TAG "OLED_IOT"
@@ -221,6 +234,132 @@ static void oled_show_text(const char *utf8_text)
 /* 兼容旧接口：状态/消息都走统一渲染 */
 static void oled_show_lines(const char *lines) { oled_show_text(lines); }
 static void oled_show_message(const char *msg)  { oled_show_text(msg); }
+
+/* ---------------- 图形绘制（draw 指令：矢量 op 列表） ----------------
+ * 设计取向与 display 一致：**设备是笨渲染器**——op 的语义、坐标合法性与贴边钳制都在
+ * 服务端（agent 的 agent/oled_draw.py）判完，固件只按名字分派到 u8g2 现成调用。
+ * 因此这里没有第二个 DSL 解析器：载荷就是 JSON 数组的数组，直接遍历。
+ * 唯一的固件侧判断是"这条 op 我认不认"——不认就跳过并计数（见 oled_draw_ops）。 */
+
+/* op 实现签名统一成 (数字参数, 字符串参数)：不足 6 个的数字参数后面补 0，非 text 的 s 为 NULL。
+ * 好处 = **一张表就是全部真相**：加一个 op 只在这张表上加一行，没有第二处要同步。 */
+typedef void (*draw_fn_t)(const int *a, const char *s);
+
+static void op_pixel(const int *a, const char *s)
+{ (void)s; u8g2_DrawPixel(&s_u8g2, a[0], a[1]); }
+
+static void op_line(const int *a, const char *s)
+{ (void)s; u8g2_DrawLine(&s_u8g2, a[0], a[1], a[2], a[3]); }
+
+static void op_box(const int *a, const char *s)
+{ (void)s; u8g2_DrawBox(&s_u8g2, a[0], a[1], a[2], a[3]); }
+
+static void op_frame(const int *a, const char *s)
+{ (void)s; u8g2_DrawFrame(&s_u8g2, a[0], a[1], a[2], a[3]); }
+
+static void op_rbox(const int *a, const char *s)
+{ (void)s; u8g2_DrawRBox(&s_u8g2, a[0], a[1], a[2], a[3], a[4]); }
+
+static void op_disc(const int *a, const char *s)
+{ (void)s; u8g2_DrawDisc(&s_u8g2, a[0], a[1], a[2], U8G2_DRAW_ALL); }
+
+static void op_circle(const int *a, const char *s)
+{ (void)s; u8g2_DrawCircle(&s_u8g2, a[0], a[1], a[2], U8G2_DRAW_ALL); }
+
+static void op_tri(const int *a, const char *s)
+{ (void)s; u8g2_DrawTriangle(&s_u8g2, a[0], a[1], a[2], a[3], a[4], a[5]); }
+
+/* text 的 (x,y) 是**左上角**（与其它 op 的坐标语义一致）；u8g2 的 y 是基线，故加 ascent。 */
+static void op_text(const int *a, const char *s)
+{
+    int ascent = u8g2_GetFontAscent(&s_u8g2);
+    if (ascent <= 0 || ascent > FONT_LINE_H) ascent = FONT_LINE_H - 1;
+    u8g2_DrawUTF8(&s_u8g2, a[0], a[1] + ascent, s);
+}
+
+/* op 表：名字 / 数字参数个数 / 末位是否为字符串 / 实现 */
+typedef struct {
+    const char *name;
+    int         argc;
+    bool        tail_str;
+    draw_fn_t   fn;
+} draw_op_t;
+
+static const draw_op_t DRAW_OPS[] = {
+    { "pixel",  2, false, op_pixel  },
+    { "line",   4, false, op_line   },
+    { "box",    4, false, op_box    },
+    { "frame",  4, false, op_frame  },
+    { "rbox",   5, false, op_rbox   },
+    { "disc",   3, false, op_disc   },
+    { "circle", 3, false, op_circle },
+    { "tri",    6, false, op_tri    },
+    { "text",   3, true,  op_text   },
+};
+#define DRAW_OP_COUNT ((int)(sizeof(DRAW_OPS) / sizeof(DRAW_OPS[0])))
+
+/* 执行一条 draw 指令的 ops 数组。
+ *   - 无 clear op：**每条 draw 一律先清屏**再按序绘制（与 display 覆盖整屏一致）。
+ *   - 未知 op / 参数个数不符 / 参数类型不符 ⇒ 跳过该 op 并计入 *skipped，
+ *     **不中断整幅画**（缺一个图形比整屏空白更接近意图），也**不静默**（数进了回执）。
+ *   - 坐标不在这里钳制：u8g2 自己会裁掉画布外的部分，而贴边钳制已在服务端做（见上）。
+ *   - 返回实际绘制的 op 数；调用方负责 SendBuffer 与回执。 */
+static int oled_draw_ops(const cJSON *ops, int *skipped)
+{
+    int total = cJSON_GetArraySize(ops);
+    int drawn = 0, skip = 0;
+
+    if (total > DRAW_MAX_OPS) {
+        ESP_LOGW(TAG, "draw: %d ops 超上限 %d，多余的 %d 条不绘制",
+                 total, DRAW_MAX_OPS, total - DRAW_MAX_OPS);
+        skip += total - DRAW_MAX_OPS;
+        total = DRAW_MAX_OPS;
+    }
+
+    if (s_disp_mutex) xSemaphoreTake(s_disp_mutex, portMAX_DELAY);
+    u8g2_ClearBuffer(&s_u8g2);
+    /* 字体固定为设备自带的中文全量字库（op_text 用；其它 op 不受影响） */
+    u8g2_SetFont(&s_u8g2, u8g2_font_wqy12_t_gb2312);
+
+    for (int i = 0; i < total; i++) {
+        const cJSON *op = cJSON_GetArrayItem(ops, i);       /* 不是数组时下面 GetArraySize 得 0 */
+        const cJSON *nm = cJSON_IsArray(op) ? cJSON_GetArrayItem(op, 0) : NULL;
+        const draw_op_t *def = NULL;
+        if (cJSON_IsString(nm)) {
+            for (int k = 0; k < DRAW_OP_COUNT; k++) {
+                if (strcmp(DRAW_OPS[k].name, nm->valuestring) == 0) { def = &DRAW_OPS[k]; break; }
+            }
+        }
+
+        int a[6] = { 0 };
+        const char *s = NULL;
+        int argc = def ? def->argc : 0;                     /* def 为 NULL 时 argc=0，下面的循环必然不进 */
+        bool ok = (argc > 0) && (cJSON_GetArraySize(op) == argc + 1);
+        for (int k = 0; ok && k < argc; k++) {
+            const cJSON *it = cJSON_GetArrayItem(op, k + 1);
+            if (def->tail_str && k == argc - 1) {
+                if (cJSON_IsString(it)) s = it->valuestring; else ok = false;
+            } else if (cJSON_IsNumber(it)) {
+                a[k] = it->valueint;
+            } else {
+                ok = false;
+            }
+        }
+
+        if (!ok) {
+            ESP_LOGW(TAG, "draw: 跳过第 %d 条 op（名字未知或参数个数/类型不符）", i);
+            skip++;
+            continue;
+        }
+        def->fn(a, s);
+        drawn++;
+    }
+
+    u8g2_SendBuffer(&s_u8g2);
+    if (s_disp_mutex) xSemaphoreGive(s_disp_mutex);
+    *skipped = skip;
+    return drawn;
+}
 
 /* ---------------- 配置持久化（NVS） ---------------- */
 static void config_save(void)
@@ -412,6 +551,9 @@ static void mqtt_start(void)
                 .certificate = (const char *)mqtt_ca_pem_start,  /* 校验证书链 */
             },
         },
+        .buffer = {
+            .size = RX_BUF_SIZE,       /* 接收缓冲：esp-mqtt 默认 1024，draw 的 ops 数组会超（见 RX_BUF_SIZE 注） */
+        },
         .credentials = {
             .username = MQTT_USER,
             .authentication = {
@@ -464,14 +606,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         break;
 
     case MQTT_EVENT_DATA: {
-        /* 收到的每条消息都完整打印，方便调试 */
-        ESP_LOGI(TAG, "rx [%.*s] %.*s",
-                 event->topic_len, event->topic,
-                 event->data_len, event->data);
+        /* 收到的每条消息都打印，方便调试。1.3.0 起 payload 可达 4KB（draw 的 ops），
+         * 日志里只回显前 256 字节并标注实际长度——整条打出来会把串口刷屏、也没人读。
+         * 注意这里用的是 **event->data_len（本片的长度）**，全量长度见 total_data_len。 */
+        int show = event->data_len < 256 ? event->data_len : 256;
+        ESP_LOGI(TAG, "rx [%.*s] len=%d %.*s%s",
+                 event->topic_len, event->topic, event->data_len,
+                 show, event->data, event->data_len > show ? " …(截断显示)" : "");
 
-        static char buf[512];
-        size_t len = event->data_len;
-        if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+        static char buf[RX_BUF_SIZE];
+        /* 分片：esp-mqtt 把超过接收缓冲的报文分多次 MQTT_EVENT_DATA 投递，此时
+         * total_data_len 才是全量、data_len 只是本片。本固件**不做分片重组**，
+         * 旧版是"截一半直接丢给 cJSON_Parse" ⇒ 日志里只剩一句语焉不详的解析失败、
+         * 设备不回执 ⇒ 调用方以为设备离线。现在明确报错并丢弃，一眼可查。 */
+        if (event->total_data_len != event->data_len) {
+            ESP_LOGE(TAG, "负载被分片（total=%d 本片=%d），本固件不支持分片重组，已丢弃",
+                     event->total_data_len, event->data_len);
+            break;
+        }
+        if (event->data_len >= (int)sizeof(buf)) {
+            ESP_LOGE(TAG, "负载 %d 字节超缓冲 %d，已丢弃（调大 RX_BUF_SIZE）",
+                     event->data_len, (int)sizeof(buf));
+            break;
+        }
+        size_t len = (size_t)event->data_len;
         memcpy(buf, event->data, len);
         buf[len] = 0;
 
@@ -514,6 +672,31 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                              req->valuestring);
                 } else {
                     snprintf(ack, sizeof(ack), "{\"ack\":true,\"type\":\"display\"}");
+                }
+                esp_mqtt_client_publish(s_mqtt, ack_topic, ack, 0, 1, 0);
+            }
+        } else if (cJSON_IsString(type) && strcmp(type->valuestring, "draw") == 0) {
+            /* 绘图：{"type":"draw","ops":[["line",0,32,127,32],["disc",64,26,18],["text",4,50,"加油"]]}
+             * ops = 数组的数组（首元素是 op 名字，其余是参数）；op 表见 DRAW_OPS。
+             * 回执照抄 display 那条路的形状（原样带回 req_id），另带本次实际绘制数与跳过数。 */
+            const cJSON *ops = cJSON_GetObjectItemCaseSensitive(root, "ops");
+            if (!cJSON_IsArray(ops)) {
+                ESP_LOGW(TAG, "draw: 缺少 ops 数组，忽略");
+            } else {
+                int skipped = 0;
+                int drawn = oled_draw_ops(ops, &skipped);
+                ESP_LOGI(TAG, "draw: %d ops 已绘制, %d 跳过", drawn, skipped);
+                char ack_topic[96], ack[192];
+                const cJSON *req = cJSON_GetObjectItemCaseSensitive(root, "req_id");
+                snprintf(ack_topic, sizeof(ack_topic), "devices/%s/cmd/ack", DEVICE_ID);
+                if (cJSON_IsString(req)) {
+                    snprintf(ack, sizeof(ack),
+                             "{\"ack\":true,\"type\":\"draw\",\"ops\":%d,\"skipped\":%d,"
+                             "\"req_id\":\"%.120s\"}", drawn, skipped, req->valuestring);
+                } else {
+                    snprintf(ack, sizeof(ack),
+                             "{\"ack\":true,\"type\":\"draw\",\"ops\":%d,\"skipped\":%d}",
+                             drawn, skipped);
                 }
                 esp_mqtt_client_publish(s_mqtt, ack_topic, ack, 0, 1, 0);
             }
